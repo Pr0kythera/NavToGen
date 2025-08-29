@@ -1,0 +1,21 @@
+# requirements.txt
+# ==================
+# Python dependencies for Enterprise MITRE ATT&CK Coverage Analyzer
+
+# Core dependencies
+requests>=2.31.0       # HTTP requests for MITRE ATT&CK data fetching
+PyYAML>=6.0.1         # YAML parsing for rule files
+urllib3>=2.0.0        # HTTP client (used by requests)
+
+# Optional dependencies for enhanced functionality
+# (The application gracefully handles missing optional dependencies)
+
+# For advanced HTTP retry strategies
+urllib3[secure]>=2.0.0
+
+# Development and testing dependencies (optional)
+pytest>=7.4.0         # Testing framework
+pytest-cov>=4.1.0     # Coverage reporting
+black>=23.7.0         # Code formatting
+flake8>=6.0.0         # Code linting
+mypy>=1.5.0           # Type checking
