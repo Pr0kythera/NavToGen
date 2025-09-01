@@ -5,13 +5,13 @@
 # Core dependencies
 requests>=2.31.0       # HTTP requests for MITRE ATT&CK data fetching
 PyYAML>=6.0.1         # YAML parsing for rule files
-urllib3>=2.0.0        # HTTP client (used by requests)
+urllib3>=2.0.7        # HTTP client (used by requests) - Updated for CVE-2023-45803 security fix
 
 # Optional dependencies for enhanced functionality
 # (The application gracefully handles missing optional dependencies)
 
 # For advanced HTTP retry strategies
-urllib3[secure]>=2.0.0
+urllib3[secure]>=2.0.7
 
 # Development and testing dependencies (optional)
 pytest>=7.4.0         # Testing framework

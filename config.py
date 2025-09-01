@@ -34,9 +34,9 @@ ENCODING = 'utf-8'                # Standard encoding for all file operations
 TECHNIQUE_ID_PATTERN = re.compile(r'\bT\d{4}(?:\.\d{3})?\b')
 
 # Navigator layer format constants
-NAVIGATOR_VERSION = "4.9.1"
+NAVIGATOR_VERSION = "5.1.1"
 LAYER_VERSION = "4.5"
-DEFAULT_ATTACK_VERSION = "15"
+DEFAULT_ATTACK_VERSION = "17"
 
 # Valid MITRE ATT&CK tactics (normalized names)
 # These represent the standard phases of a cyber attack lifecycle
@@ -133,7 +133,7 @@ def validate_attack_version(version: str) -> bool:
     Validates that an ATT&CK version string is reasonable.
     
     Args:
-        version: Version string to validate (e.g., "15", "14")
+        version: Version string to validate (e.g., "17", "16", "15")
         
     Returns:
         bool: True if version appears valid, False otherwise
