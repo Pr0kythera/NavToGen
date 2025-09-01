@@ -30,7 +30,7 @@ from typing import Dict, List, Set, Optional, Any, Tuple
 import math
 
 from models.detection_rule import DetectionRule
-from models.navigator_layer import NavigatorLayer, TechniqueEntry
+from models.navigator_layer_model import NavigatorLayer, TechniqueEntry
 from validators.mitre_validator import MitreAttackValidator
 from config import (
     COVERAGE_COLORS, 

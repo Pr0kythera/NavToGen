@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Any
 
 # Import our custom modules
 import config
-from models import detection_rule as DetectionRule
+from models.detection_rule import DetectionRule
 from validators import security_validator as SecurityValidator, mitre_validator as MitreAttackValidator
 from core import RuleRepository
 from generators import layer_generator as NavigatorLayerGenerator
