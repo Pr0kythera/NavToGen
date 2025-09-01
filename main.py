@@ -42,8 +42,8 @@ from typing import Dict, List, Optional, Any
 
 # Import our custom modules
 import config
-from models import DetectionRule
-from validators import SecurityValidator, MitreAttackValidator
+from models import detection_rule as DetectionRule
+from validators import security_validator as SecurityValidator, mitre_validator as MitreAttackValidator
 from core import RuleRepository
 from generators import NavigatorLayerGenerator
 from utils import setup_logging, create_logger, log_function_timing
