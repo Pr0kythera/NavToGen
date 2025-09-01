@@ -660,7 +660,7 @@ def main() -> int:
         return 130
         
     except Exception as e:
-        if logger.isEnabledFor(logger.DEBUG):
+        if logger.isEnabledFor(logging.DEBUG):
             logger.error(f"Unexpected error: {str(e)}\n{traceback.format_exc()}")
         else:
             print(f"\nError: {str(e)}")
