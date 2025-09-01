@@ -32,6 +32,7 @@ License: MIT
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -43,9 +44,10 @@ from typing import Dict, List, Optional, Any
 # Import our custom modules
 import config
 from models.detection_rule import DetectionRule
-from validators import security_validator as SecurityValidator, mitre_validator as MitreAttackValidator
-from core import RuleRepository
-from generators import layer_generator as NavigatorLayerGenerator
+from validators.security_validator import SecurityValidator
+from validators import mitre_validator as MitreAttackValidator
+from core.RuleRepository import RuleRepository
+from generators.layer_generator import NavigatorLayerGenerator
 from utils import setup_logging, create_logger, log_function_timing
 
 # Module logger (will be properly configured after argument parsing)

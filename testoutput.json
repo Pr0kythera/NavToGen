@@ -1,0 +1,411 @@
+{
+  "name": "Coverage Analysis - Sentinel (2025-09-01)",
+  "versions": {
+    "attack": "15",
+    "navigator": "4.9.1",
+    "layer": "4.5"
+  },
+  "domain": "enterprise-attack",
+  "description": "Coverage analysis generated on 2025-09-01 22:08:09. Analyzed 7 detection rules (0 Elastic, 7 Sentinel). Covering 13 unique MITRE ATT&CK techniques.",
+  "sorting": 0,
+  "layout": {
+    "layout": "side",
+    "aggregateFunction": "average",
+    "showID": false,
+    "showName": true,
+    "countUnscored": false
+  },
+  "hideDisabled": false,
+  "techniques": [
+    {
+      "techniqueID": "T1003.001",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: Credential Dumping Tools - Service Installation",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "High"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1016",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: Probable AdFind Recon Tool Usage",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "High"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1018",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: Probable AdFind Recon Tool Usage",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "High"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1068",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: Rare application consent",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "Medium"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1069.002",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: Probable AdFind Recon Tool Usage",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "High"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1078",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: User added to Microsoft Entra ID Privileged Groups",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "Medium"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": true
+    },
+    {
+      "techniqueID": "T1078.004",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: Application Redirect URL Update",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "Medium"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1087.002",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: Probable AdFind Recon Tool Usage",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "High"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1098",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: User added to Microsoft Entra ID Privileged Groups",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "Medium"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1110",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: Potential Password Spray Attack (Uses Authentication Normalization)",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "Medium"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1136",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: Rare application consent",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "Medium"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1482",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: Probable AdFind Recon Tool Usage",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "High"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    },
+    {
+      "techniqueID": "T1550.001",
+      "score": 30,
+      "color": "#ff6666",
+      "comment": "Coverage: 1 rule | Platforms: sentinel | Rules: First access credential added to Application or Service Principal where no credential was present",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "Rule Count",
+          "value": "1"
+        },
+        {
+          "name": "Platforms",
+          "value": "sentinel"
+        },
+        {
+          "name": "Highest Severity",
+          "value": "High"
+        },
+        {
+          "name": "Rule Types",
+          "value": "scheduled"
+        }
+      ],
+      "links": [],
+      "showSubtechniques": false
+    }
+  ],
+  "gradient": {
+    "colors": [
+      "#ff6666ff",
+      "#ffe766ff",
+      "#8ec843ff"
+    ],
+    "minValue": 0,
+    "maxValue": 100
+  },
+  "legendItems": [
+    {
+      "label": "High Coverage (5+ rules)",
+      "color": "#8ec843"
+    },
+    {
+      "label": "Medium Coverage (2-4 rules)",
+      "color": "#ffe766"
+    },
+    {
+      "label": "Low Coverage (1 rule)",
+      "color": "#ff6666"
+    }
+  ],
+  "metadata": [],
+  "links": [],
+  "filters": {
+    "platforms": [
+      "Linux",
+      "macOS",
+      "Windows",
+      "Azure AD",
+      "Office 365",
+      "SaaS",
+      "IaaS",
+      "Google Workspace",
+      "PRE",
+      "Network"
+    ]
+  }
+}

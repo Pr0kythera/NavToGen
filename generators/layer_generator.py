@@ -490,7 +490,7 @@ class NavigatorLayerGenerator:
         # Add rule type diversity
         rule_types = data.get('rule_types', [])
         if rule_types:
-            technique_entry.add_metadata("Rule Types", ", ".join(set(rule_types)[:3]))  # Limit for readability
+            technique_entry.add_metadata("Rule Types", ", ".join(list(set(rule_types))[:3]))  # Limit for readability
     
     def _add_mitre_metadata(self, technique_entry: TechniqueEntry, technique_id: str) -> None:
         """
