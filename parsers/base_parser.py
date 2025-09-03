@@ -20,6 +20,7 @@ The abstract base class pattern provides several benefits:
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any
 import logging
+import threading
 
 from models.detection_rule import DetectionRule
 
@@ -61,6 +62,7 @@ class BaseRuleParser(ABC):
             'techniques_extracted': 0,
             'tactics_extracted': 0
         }
+        self._stats_lock = threading.Lock()  # Thread-safe statistics updates
         
         logger.debug(f"Initialized {parser_name} parser")
     
@@ -260,7 +262,7 @@ class BaseRuleParser(ABC):
     
     def update_statistics(self, success: bool, techniques_found: int = 0, tactics_found: int = 0):
         """
-        Update parser statistics for monitoring and reporting.
+        Update parser statistics for monitoring and reporting (thread-safe).
         
         This method tracks parsing performance and success rates, which
         is valuable for monitoring system health and identifying issues
@@ -271,18 +273,19 @@ class BaseRuleParser(ABC):
             techniques_found: Number of techniques extracted from this rule
             tactics_found: Number of tactics extracted from this rule
         """
-        self.parse_statistics['files_processed'] += 1
-        
-        if success:
-            self.parse_statistics['successful_parses'] += 1
-            self.parse_statistics['techniques_extracted'] += techniques_found
-            self.parse_statistics['tactics_extracted'] += tactics_found
-        else:
-            self.parse_statistics['failed_parses'] += 1
-        
-        # Log statistics periodically for monitoring
-        if self.parse_statistics['files_processed'] % 100 == 0:
-            self.log_statistics()
+        with self._stats_lock:  # Thread-safe statistics updates
+            self.parse_statistics['files_processed'] += 1
+            
+            if success:
+                self.parse_statistics['successful_parses'] += 1
+                self.parse_statistics['techniques_extracted'] += techniques_found
+                self.parse_statistics['tactics_extracted'] += tactics_found
+            else:
+                self.parse_statistics['failed_parses'] += 1
+            
+            # Log statistics periodically for monitoring
+            if self.parse_statistics['files_processed'] % 100 == 0:
+                self.log_statistics()
     
     def log_statistics(self):
         """Log current parsing statistics for monitoring purposes."""
@@ -298,12 +301,13 @@ class BaseRuleParser(ABC):
     
     def get_statistics(self) -> Dict[str, Any]:
         """
-        Get current parser statistics as a dictionary.
+        Get current parser statistics as a dictionary (thread-safe).
         
         Returns:
             Dict[str, Any]: Current parsing statistics
         """
-        stats = self.parse_statistics.copy()
+        with self._stats_lock:
+            stats = self.parse_statistics.copy()
         stats['parser_name'] = self.parser_name
         stats['success_rate'] = (
             stats['successful_parses'] / stats['files_processed'] * 100 

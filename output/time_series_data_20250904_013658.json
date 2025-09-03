@@ -1,0 +1,127 @@
+{
+  "coverage_trends": [
+    {
+      "date": "2024-09-01T12:00:00",
+      "days_since_baseline": 0.0,
+      "total_coverage_percent": 10.62,
+      "tactic_coverage_percent": 85.71,
+      "unique_techniques": 85,
+      "unique_tactics": 12
+    },
+    {
+      "date": "2024-10-01T12:00:00",
+      "days_since_baseline": 30.0,
+      "total_coverage_percent": 12.75,
+      "tactic_coverage_percent": 85.71,
+      "unique_techniques": 102,
+      "unique_tactics": 12
+    },
+    {
+      "date": "2024-11-01T12:00:00",
+      "days_since_baseline": 61.0,
+      "total_coverage_percent": 15.62,
+      "tactic_coverage_percent": 85.71,
+      "unique_techniques": 125,
+      "unique_tactics": 12
+    }
+  ],
+  "rule_growth": [
+    {
+      "date": "2024-09-01T12:00:00",
+      "days_since_baseline": 0.0,
+      "total_rules": 145,
+      "rules_with_techniques": 0
+    },
+    {
+      "date": "2024-10-01T12:00:00",
+      "days_since_baseline": 30.0,
+      "total_rules": 175,
+      "rules_with_techniques": 0
+    },
+    {
+      "date": "2024-11-01T12:00:00",
+      "days_since_baseline": 61.0,
+      "total_rules": 215,
+      "rules_with_techniques": 0
+    }
+  ],
+  "technique_growth": [
+    {
+      "date": "2024-09-01T12:00:00",
+      "days_since_baseline": 0.0,
+      "unique_techniques": 85,
+      "total_technique_mappings": 68
+    },
+    {
+      "date": "2024-10-01T12:00:00",
+      "days_since_baseline": 30.0,
+      "unique_techniques": 102,
+      "total_technique_mappings": 114
+    },
+    {
+      "date": "2024-11-01T12:00:00",
+      "days_since_baseline": 61.0,
+      "unique_techniques": 125,
+      "total_technique_mappings": 172
+    }
+  ],
+  "tactic_growth": [
+    {
+      "date": "2024-09-01T12:00:00",
+      "days_since_baseline": 0.0,
+      "unique_tactics": 12,
+      "total_tactic_mappings": 153
+    },
+    {
+      "date": "2024-10-01T12:00:00",
+      "days_since_baseline": 30.0,
+      "unique_tactics": 12,
+      "total_tactic_mappings": 202
+    },
+    {
+      "date": "2024-11-01T12:00:00",
+      "days_since_baseline": 61.0,
+      "unique_tactics": 12,
+      "total_tactic_mappings": 279
+    }
+  ],
+  "velocity_metrics": [
+    {
+      "date": "2024-10-01T12:00:00",
+      "days_since_baseline": 30.0,
+      "rules_per_day": 1.0,
+      "techniques_per_day": 0.57,
+      "period_days": 30.0
+    },
+    {
+      "date": "2024-11-01T12:00:00",
+      "days_since_baseline": 61.0,
+      "rules_per_day": 1.29,
+      "techniques_per_day": 0.74,
+      "period_days": 31.0
+    }
+  ],
+  "platform_distribution": [
+    {
+      "date": "2024-09-01T12:00:00",
+      "days_since_baseline": 0.0,
+      "elastic_rules": 80,
+      "sentinel_rules": 65,
+      "total_rules": 145
+    },
+    {
+      "date": "2024-10-01T12:00:00",
+      "days_since_baseline": 30.0,
+      "elastic_rules": 95,
+      "sentinel_rules": 80,
+      "total_rules": 175
+    },
+    {
+      "date": "2024-11-01T12:00:00",
+      "days_since_baseline": 61.0,
+      "elastic_rules": 115,
+      "sentinel_rules": 100,
+      "total_rules": 215
+    }
+  ]
+}

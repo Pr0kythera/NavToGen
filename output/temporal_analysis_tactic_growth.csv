@@ -1,0 +1,4 @@
+date,days_since_baseline,unique_tactics,total_tactic_mappings
+2024-09-01T12:00:00,0.0,12,153
+2024-10-01T12:00:00,30.0,12,202
+2024-11-01T12:00:00,61.0,12,279

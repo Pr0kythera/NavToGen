@@ -1,0 +1,4 @@
+date,days_since_baseline,elastic_rules,sentinel_rules,total_rules
+2024-09-01T12:00:00,0.0,80,65,145
+2024-10-01T12:00:00,30.0,95,80,175
+2024-11-01T12:00:00,61.0,115,100,215

@@ -1,0 +1,4 @@
+date,days_since_baseline,total_coverage_percent,tactic_coverage_percent,unique_techniques,unique_tactics
+2024-09-01T12:00:00,0.0,10.62,85.71,85,12
+2024-10-01T12:00:00,30.0,12.75,85.71,102,12
+2024-11-01T12:00:00,61.0,15.62,85.71,125,12

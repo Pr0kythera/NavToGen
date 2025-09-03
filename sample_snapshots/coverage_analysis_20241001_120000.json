@@ -1,0 +1,80 @@
+{
+  "generation_timestamp": "2024-10-01T12:00:00",
+  "parsing_statistics": {
+    "discovery": {
+      "directories_scanned": 18,
+      "files_discovered": 180,
+      "files_skipped": 3,
+      "discovery_time_seconds": 2.8
+    },
+    "parsing": {
+      "total_files": 180,
+      "successful_parses": 175,
+      "failed_parses": 5,
+      "parsing_time_seconds": 9.5,
+      "files_per_second": 18.9
+    },
+    "by_platform": {
+      "elastic_rules": 95,
+      "sentinel_rules": 80,
+      "unknown_format": 0
+    },
+    "attack_analysis": {
+      "total_techniques": 380,
+      "unique_techniques": ["T1055", "T1003", "T1059", "T1078", "T1090", "T1136", "T1543", "T1547", "T1569", "T1562", "T1071", "T1110", "T1190", "T1204", "T1566"],
+      "total_tactics": 52,
+      "unique_tactics": ["initial-access", "execution", "persistence", "privilege-escalation", "defense-evasion", "credential-access", "discovery", "lateral-movement", "collection", "command-and-control", "exfiltration", "impact"],
+      "techniques_validated": 375,
+      "techniques_invalid": 5
+    },
+    "errors": {
+      "parse_errors": [],
+      "validation_errors": [],
+      "security_violations": []
+    }
+  },
+  "coverage_analysis": {
+    "total_rules": 175,
+    "rules_with_techniques": 170,
+    "unique_techniques": 102,
+    "technique_frequency": {
+      "T1055": 10,
+      "T1003": 8,
+      "T1059": 15,
+      "T1078": 11,
+      "T1090": 6,
+      "T1136": 7,
+      "T1543": 9,
+      "T1547": 8,
+      "T1569": 5,
+      "T1562": 10,
+      "T1071": 4,
+      "T1110": 6,
+      "T1190": 3,
+      "T1204": 5,
+      "T1566": 7
+    },
+    "tactic_coverage_counts": {
+      "initial-access": 20,
+      "execution": 30,
+      "persistence": 23,
+      "privilege-escalation": 16,
+      "defense-evasion": 25,
+      "credential-access": 18,
+      "discovery": 20,
+      "lateral-movement": 12,
+      "collection": 9,
+      "command-and-control": 14,
+      "exfiltration": 7,
+      "impact": 8
+    },
+    "platform_analysis": {
+      "total_rules": 175,
+      "by_platform": {
+        "elastic_rules": 95,
+        "sentinel_rules": 80,
+        "unknown_format": 0
+      }
+    }
+  }
+}

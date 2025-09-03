@@ -47,6 +47,7 @@ from models.detection_rule import DetectionRule
 from validators.security_validator import SecurityValidator
 from validators import mitre_validator as MitreAttackValidator
 from core.RuleRepository import RuleRepository
+from core.temporal_analysis import TemporalAnalyzer
 from generators.layer_generator import NavigatorLayerGenerator
 from utils import setup_logging, create_logger, log_function_timing
 
@@ -91,6 +92,10 @@ class AnalysisSession:
             int: Exit code (0 for success, non-zero for error)
         """
         try:
+            # Branch for temporal analysis mode
+            if self.args.temporal_analysis:
+                return self._run_temporal_analysis()
+            
             logger.info("Starting enterprise MITRE ATT&CK coverage analysis")
             
             # Phase 1: Initialize validators and components
@@ -299,6 +304,10 @@ class AnalysisSession:
         """
         logger.info("Saving analysis results...")
         
+        # Generate default output path if not provided
+        if not self.args.output:
+            self.args.output = self._generate_default_output_path()
+        
         # Validate and sanitize output path
         output_path = SecurityValidator.sanitize_filename(self.args.output)
         is_valid, error_msg = SecurityValidator.validate_output_path(output_path)
@@ -342,8 +351,16 @@ class AnalysisSession:
         # Add layer information
         coverage_report['output_info'] = self.results.copy()
         
+        # Generate default report path if relative path provided
+        report_path = self.args.report
+        if not os.path.isabs(report_path):
+            from pathlib import Path
+            output_dir = Path("output")
+            output_dir.mkdir(exist_ok=True)
+            report_path = str(output_dir / report_path)
+        
         # Save report
-        report_path = SecurityValidator.sanitize_filename(self.args.report)
+        report_path = SecurityValidator.sanitize_filename(report_path)
         try:
             with open(report_path, 'w', encoding='utf-8') as f:
                 json.dump(coverage_report, f, indent=2, default=str, ensure_ascii=False)
@@ -427,6 +444,27 @@ class AnalysisSession:
         timestamp = datetime.now().strftime("%Y-%m-%d")
         return f"{base_name} ({timestamp})"
     
+    def _generate_default_output_path(self) -> str:
+        """Generate a default output file path with timestamp."""
+        from pathlib import Path
+        import os
+        
+        # Create output directory if it doesn't exist
+        output_dir = Path("output")
+        output_dir.mkdir(exist_ok=True)
+        
+        # Generate filename based on analysis mode
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if self.args.comparison_mode:
+            filename = f"platform_comparison_{timestamp}.json"
+        elif self.args.frequency_mode:
+            filename = f"frequency_analysis_{timestamp}.json"
+        else:
+            filename = f"coverage_analysis_{timestamp}.json"
+        
+        return str(output_dir / filename)
+    
     def _build_layer_description(self, rules: List[DetectionRule], analysis_type: str) -> str:
         """Build a descriptive description for the generated layer."""
         elastic_count = sum(1 for rule in rules if rule.rule_type.startswith('elastic'))
@@ -447,6 +485,149 @@ class AnalysisSession:
             description_parts.append(f"Validated against ATT&CK {validation_summary['data_version']}")
         
         return ". ".join(description_parts) + "."
+    
+    def _run_temporal_analysis(self) -> int:
+        """
+        Run temporal analysis comparing multiple snapshots over time.
+        
+        Returns:
+            int: Exit code (0 for success, non-zero for error)
+        """
+        logger.info("Starting temporal analysis of detection coverage snapshots")
+        
+        try:
+            # Initialize temporal analyzer
+            analyzer = TemporalAnalyzer()
+            
+            # Load snapshots from directory
+            snapshots_loaded = analyzer.load_snapshots_from_directory(
+                self.args.snapshots_directory, "*.json"
+            )
+            
+            if snapshots_loaded < 2:
+                logger.error(f"Need at least 2 snapshots for temporal analysis, found {snapshots_loaded}")
+                return 1
+            
+            logger.info(f"Loaded {snapshots_loaded} snapshots for analysis")
+            
+            # Generate time-series data
+            time_series = analyzer.generate_time_series_data()
+            
+            # Generate executive summary
+            executive_summary = analyzer.generate_executive_summary()
+            
+            # Create output directory if needed
+            from pathlib import Path
+            output_dir = Path("output")
+            output_dir.mkdir(exist_ok=True)
+            
+            # Save time-series data as CSV files
+            csv_files = analyzer.export_to_csv(str(output_dir))
+            
+            # Save executive summary
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            summary_path = output_dir / f"executive_summary_{timestamp}.json"
+            
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                json.dump(executive_summary, f, indent=2, default=str, ensure_ascii=False)
+            
+            # Save detailed time-series data
+            timeseries_path = output_dir / f"time_series_data_{timestamp}.json"
+            with open(timeseries_path, 'w', encoding='utf-8') as f:
+                json.dump(time_series, f, indent=2, default=str, ensure_ascii=False)
+            
+            # Display results summary
+            self._display_temporal_analysis_summary(
+                executive_summary, csv_files, str(summary_path), str(timeseries_path)
+            )
+            
+            logger.info("Temporal analysis completed successfully")
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Temporal analysis failed: {str(e)}")
+            logger.debug(f"Full traceback:\n{traceback.format_exc()}")
+            return 1
+    
+    def _display_temporal_analysis_summary(self, executive_summary: Dict[str, Any], 
+                                         csv_files: List[str], summary_path: str, 
+                                         timeseries_path: str) -> None:
+        """Display comprehensive temporal analysis results summary."""
+        print("\n" + "="*70)
+        print("TEMPORAL DETECTION COVERAGE ANALYSIS - EXECUTIVE SUMMARY")
+        print("="*70)
+        
+        # Analysis period
+        period = executive_summary.get('analysis_period', {})
+        print(f"Analysis Period: {period.get('start_date', 'N/A')} to {period.get('end_date', 'N/A')}")
+        print(f"Total Duration: {period.get('total_days', 0):.1f} days")
+        print(f"Snapshots Analyzed: {period.get('total_snapshots', 0)}")
+        print()
+        
+        # Overall growth metrics
+        growth = executive_summary.get('overall_growth', {})
+        print("OVERALL GROWTH METRICS:")
+        print(f"  Rules Added: {growth.get('rules_added', 0)}")
+        print(f"  New Techniques Covered: {growth.get('techniques_added', 0)}")
+        print(f"  New Tactics Covered: {growth.get('tactics_added', 0)}")
+        print(f"  Coverage Improvement: {growth.get('coverage_improvement_percent', 0):.2f} percentage points")
+        print(f"  Tactic Coverage Improvement: {growth.get('tactic_coverage_improvement_percent', 0):.2f} percentage points")
+        print()
+        
+        # Current status
+        status = executive_summary.get('current_status', {})
+        print("CURRENT DETECTION STATUS:")
+        print(f"  Total Rules: {status.get('total_rules', 0)}")
+        print(f"  Unique Techniques: {status.get('unique_techniques_covered', 0)}")
+        print(f"  Unique Tactics: {status.get('unique_tactics_covered', 0)}")
+        print(f"  Overall Coverage: {status.get('overall_coverage_percent', 0):.2f}%")
+        print(f"  Tactic Coverage: {status.get('tactic_coverage_percent', 0):.2f}%")
+        print()
+        
+        # Velocity metrics
+        velocity = executive_summary.get('velocity_metrics', {})
+        print("DEVELOPMENT VELOCITY:")
+        print(f"  Rules Per Day: {velocity.get('average_rules_per_day', 0):.2f}")
+        print(f"  Techniques Per Day: {velocity.get('average_techniques_per_day', 0):.3f}")
+        print(f"  Rules Per Month: {velocity.get('average_rules_per_month', 0):.1f}")
+        print(f"  Techniques Per Month: {velocity.get('average_techniques_per_month', 0):.2f}")
+        print()
+        
+        # Trend analysis
+        trends = executive_summary.get('trend_analysis', {})
+        acceleration = trends.get('acceleration_indicators', {})
+        if 'rules_acceleration' in acceleration:
+            print("TREND INDICATORS:")
+            print(f"  Rules Development: {acceleration.get('rules_acceleration', 'unknown').title()}")
+            print(f"  Techniques Coverage: {acceleration.get('techniques_acceleration', 'unknown').title()}")
+            print()
+        
+        # Output files
+        print("OUTPUT FILES GENERATED:")
+        print(f"  Executive Summary: {summary_path}")
+        print(f"  Time-Series Data: {timeseries_path}")
+        print("  CSV Files for Charting:")
+        for csv_file in csv_files:
+            print(f"    - {csv_file}")
+        print()
+        
+        # Recommendations
+        recommendations = executive_summary.get('recommendations', [])
+        if recommendations:
+            print("KEY RECOMMENDATIONS:")
+            for i, rec in enumerate(recommendations[:5], 1):  # Show top 5
+                print(f"  {i}. {rec}")
+            print()
+        
+        print("NEXT STEPS FOR CISO REPORTING:")
+        print("1. Use CSV files to create executive dashboards and trend charts")
+        print("2. Import time-series data into BI tools for deeper analysis")
+        print("3. Schedule regular snapshot collection for continuous monitoring")
+        print("4. Set quarterly targets based on current velocity metrics")
+        print()
+        
+        print("✓ Temporal analysis completed - ready for executive presentation")
+        print("="*70)
 
 
 def setup_argument_parser() -> argparse.ArgumentParser:
@@ -475,6 +656,9 @@ Examples:
   # Frequency analysis for rule prioritization
   python main.py -p /path/to/rules -o frequency.json \\
                  --frequency-mode --validate-online
+  
+  # Temporal analysis for executive reporting
+  python main.py --temporal-analysis --snapshots-directory output/
 
 For more information and documentation:
 https://github.com/your-org/enterprise-mitre-analyzer
@@ -486,15 +670,15 @@ https://github.com/your-org/enterprise-mitre-analyzer
     required.add_argument(
         "-p", "--path",
         type=str,
-        required=True,
-        help="Path to directory containing detection rules"
+        required=False,
+        help="Path to directory containing detection rules (not required for temporal analysis)"
     )
     
     required.add_argument(
         "-o", "--output",
         type=str,
-        required=True,
-        help="Output path for Navigator layer JSON file"
+        required=False,
+        help="Output path for Navigator layer JSON file (default: output/coverage_analysis_TIMESTAMP.json)"
     )
     
     # Analysis mode options
@@ -509,6 +693,18 @@ https://github.com/your-org/enterprise-mitre-analyzer
         "--frequency-mode",
         action="store_true",
         help="Generate frequency analysis layer showing technique occurrence rates"
+    )
+    
+    analysis.add_argument(
+        "--temporal-analysis",
+        action="store_true",
+        help="Perform temporal analysis comparing multiple snapshots over time"
+    )
+    
+    analysis.add_argument(
+        "--snapshots-directory",
+        type=str,
+        help="Directory containing historical analysis snapshots for temporal analysis"
     )
     
     # Filtering and configuration
@@ -602,7 +798,8 @@ def validate_arguments(args: argparse.Namespace) -> None:
     # Check for mutually exclusive analysis modes
     mode_count = sum([
         args.comparison_mode,
-        args.frequency_mode
+        args.frequency_mode,
+        args.temporal_analysis
     ])
     
     if mode_count > 1:
@@ -620,8 +817,19 @@ def validate_arguments(args: argparse.Namespace) -> None:
     if args.comparison_mode and args.rule_type != "both":
         logger.warning("Comparison mode works best with --rule-type both")
     
-    # Validate output file extension
-    if not args.output.lower().endswith('.json'):
+    # Validate temporal analysis requirements
+    if args.temporal_analysis:
+        if not args.snapshots_directory:
+            raise ValueError("Temporal analysis requires --snapshots-directory")
+        if not Path(args.snapshots_directory).exists():
+            raise ValueError(f"Snapshots directory does not exist: {args.snapshots_directory}")
+    
+    # Validate that path is provided for non-temporal analysis
+    if not args.temporal_analysis and not args.path:
+        raise ValueError("Path to detection rules directory is required for all analysis modes except temporal analysis")
+    
+    # Validate output file extension (only if output is provided)
+    if args.output and not args.output.lower().endswith('.json'):
         logger.warning("Output file should have .json extension for Navigator compatibility")
 
 

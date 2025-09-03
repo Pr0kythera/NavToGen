@@ -1,0 +1,75 @@
+{
+  "generation_timestamp": "2024-09-01T12:00:00",
+  "parsing_statistics": {
+    "discovery": {
+      "directories_scanned": 15,
+      "files_discovered": 150,
+      "files_skipped": 5,
+      "discovery_time_seconds": 2.5
+    },
+    "parsing": {
+      "total_files": 150,
+      "successful_parses": 145,
+      "failed_parses": 5,
+      "parsing_time_seconds": 8.2,
+      "files_per_second": 18.3
+    },
+    "by_platform": {
+      "elastic_rules": 80,
+      "sentinel_rules": 65,
+      "unknown_format": 0
+    },
+    "attack_analysis": {
+      "total_techniques": 320,
+      "unique_techniques": ["T1055", "T1003", "T1059", "T1078", "T1090", "T1136", "T1543", "T1547", "T1569", "T1562"],
+      "total_tactics": 45,
+      "unique_tactics": ["initial-access", "execution", "persistence", "privilege-escalation", "defense-evasion", "credential-access", "discovery", "lateral-movement", "collection", "command-and-control"],
+      "techniques_validated": 315,
+      "techniques_invalid": 5
+    },
+    "errors": {
+      "parse_errors": [],
+      "validation_errors": [],
+      "security_violations": []
+    }
+  },
+  "coverage_analysis": {
+    "total_rules": 145,
+    "rules_with_techniques": 140,
+    "unique_techniques": 85,
+    "technique_frequency": {
+      "T1055": 8,
+      "T1003": 6,
+      "T1059": 12,
+      "T1078": 9,
+      "T1090": 4,
+      "T1136": 5,
+      "T1543": 7,
+      "T1547": 6,
+      "T1569": 3,
+      "T1562": 8
+    },
+    "tactic_coverage_counts": {
+      "initial-access": 15,
+      "execution": 25,
+      "persistence": 18,
+      "privilege-escalation": 12,
+      "defense-evasion": 20,
+      "credential-access": 14,
+      "discovery": 16,
+      "lateral-movement": 8,
+      "collection": 6,
+      "command-and-control": 10,
+      "exfiltration": 4,
+      "impact": 5
+    },
+    "platform_analysis": {
+      "total_rules": 145,
+      "by_platform": {
+        "elastic_rules": 80,
+        "sentinel_rules": 65,
+        "unknown_format": 0
+      }
+    }
+  }
+}
