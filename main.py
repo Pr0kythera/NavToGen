@@ -45,7 +45,7 @@ from typing import Dict, List, Optional, Any
 import config
 from models.detection_rule import DetectionRule
 from validators.security_validator import SecurityValidator
-from validators import mitre_validator as MitreAttackValidator
+from validators.mitre_validator import MitreAttackValidator
 from core.RuleRepository import RuleRepository
 from core.temporal_analysis import TemporalAnalyzer
 from generators.layer_generator import NavigatorLayerGenerator
@@ -308,8 +308,12 @@ class AnalysisSession:
         if not self.args.output:
             self.args.output = self._generate_default_output_path()
         
-        # Validate and sanitize output path
-        output_path = SecurityValidator.sanitize_filename(self.args.output)
+        # Validate and sanitize output path - only sanitize the filename, not the full path
+        from pathlib import Path
+        output_path_obj = Path(self.args.output)
+        sanitized_filename = SecurityValidator.sanitize_filename(output_path_obj.name)
+        output_path = str(output_path_obj.parent / sanitized_filename)
+        
         is_valid, error_msg = SecurityValidator.validate_output_path(output_path)
         
         if not is_valid:

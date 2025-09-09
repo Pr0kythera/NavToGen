@@ -109,8 +109,8 @@ class MitreAttackValidator:
         # This handles temporary network issues and server overload gracefully
         retry_strategy = Retry(
             total=HTTP_RETRY_ATTEMPTS,
-            status_forcelist=HTTP_RETRY_STATUS_CODES,
-            method_whitelist=["HEAD", "GET", "OPTIONS"],
+            status=HTTP_RETRY_STATUS_CODES,
+            allowed_methods=["HEAD", "GET", "OPTIONS"],
             backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
             raise_on_status=False
         )
