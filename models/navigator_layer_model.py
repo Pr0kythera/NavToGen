@@ -51,6 +51,7 @@ class TechniqueEntry:
     """
     
     technique_id: str
+    tactic: Optional[str] = None  # Scope the entry to one tactic column (None = every column)
     score: int = 1
     color: str = ""
     comment: str = ""
@@ -116,7 +117,7 @@ class TechniqueEntry:
         Returns:
             Dict[str, Any]: Navigator-compatible technique entry
         """
-        return {
+        entry = {
             "techniqueID": self.technique_id,
             "score": self.score,
             "color": self.color,
@@ -126,6 +127,9 @@ class TechniqueEntry:
             "links": self.links,
             "showSubtechniques": self.show_subtechniques
         }
+        if self.tactic:
+            entry["tactic"] = self.tactic
+        return entry
 
 
 @dataclass
@@ -384,7 +388,11 @@ class NavigatorLayer:
                 "aggregateFunction": "average",
                 "showID": False,
                 "showName": True,
-                "countUnscored": False
+                "countUnscored": False,
+                # Expand sub-techniques that carry an annotation (score/comment/color) so
+                # coverage of e.g. T1003.001 is visible without opening the parent cell.
+                # No parent entry is fabricated: a parent is only "covered" if a rule maps to it.
+                "expandedSubtechniques": "annotated"
             },
             "hideDisabled": self.hide_disabled,
             "techniques": [t.to_dict() for t in self.techniques],
@@ -439,6 +447,5 @@ class NavigatorLayer:
         if not self.description:
             self.description = f"Navigator layer '{self.name}' generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         
-        # Set up default filters if none provided
-        if self.layer_filter is None:
-            self.set_default_filters()
+        # No platform filter is applied by default: filtering hides techniques, and the
+        # platform names in ATT&CK change between releases. Use --platforms to opt in.

@@ -1,34 +1,50 @@
 """
 MITRE ATT&CK Framework Validator
-==============================
+================================
 
-This module validates technique IDs against the official MITRE ATT&CK framework,
-ensuring that our coverage analysis only includes legitimate, current techniques.
+Loads the Enterprise ATT&CK STIX bundle and answers questions about it:
 
-Think of this as the "fact checker" for our MITRE ATT&CK analysis. While the security
-validator protects against malicious inputs, this validator ensures the accuracy and
-relevance of our technique identifications.
+- Is this technique ID real and currently active (not revoked or deprecated)?
+- If it was revoked, which technique replaced it?
+- Which tactics exist in this ATT&CK release, and what are their short names?
+- Which ATT&CK version is this data?
 
-The validator can operate in two modes:
-1. Online mode: Fetches the latest ATT&CK data for real-time validation
-2. Offline mode: Uses format validation only when network access isn't available
+Data sources
+------------
+By default the bundle is downloaded from the ``attack-stix-data`` repository (STIX 2.1),
+which carries an ``x-mitre-collection`` object holding the real ATT&CK version and an
+``index.json`` listing every versioned release. A local file (STIX 2.0 from ``mitre/cti``
+or STIX 2.1) can be supplied for offline and air-gapped use.
 
-This dual approach ensures the system remains functional even in restricted network
-environments while providing enhanced validation when possible.
+Downloads are cached on disk (default ``$XDG_CACHE_HOME/navtogen`` or ``~/.cache/navtogen``)
+and revalidated with ``If-None-Match`` so repeat runs do not re-download ~50MB. If the
+network is unavailable a stale cache is used with a warning rather than failing.
+
+When no data is loaded the validator falls back to format-only checks.
 """
 
+import hashlib
 import json
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, Set, Optional, Any, Tuple
+import os
 import re
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Optional, Set, Tuple
 
 from config import (
-    MITRE_ATTACK_URL,
-    MITRE_REQUEST_TIMEOUT,
     HTTP_RETRY_ATTEMPTS,
     HTTP_RETRY_BACKOFF_FACTOR,
-    HTTP_RETRY_STATUS_CODES
+    HTTP_RETRY_STATUS_CODES,
+    MITRE_ATTACK_INDEX_URL,
+    MITRE_ATTACK_URL,
+    MITRE_CACHE_DIR_NAME,
+    MITRE_CACHE_HOURS,
+    MITRE_ENTERPRISE_COLLECTION_NAME,
+    MITRE_REQUEST_TIMEOUT,
+    MAX_ATTACK_DATA_BYTES,
+    VERSION,
 )
 
 # Optional imports with graceful degradation
@@ -37,527 +53,496 @@ try:
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
     HAS_REQUESTS = True
-except ImportError:
+except ImportError:  # pragma: no cover - requests is a declared dependency
     HAS_REQUESTS = False
 
 logger = logging.getLogger(__name__)
 
+_TECHNIQUE_FORMAT = re.compile(r'^T\d{4}(\.\d{3})?$')
+_MAX_REVOKED_CHAIN = 10  # Guard against cycles in revoked-by chains
+
+
+def default_cache_dir() -> Path:
+    """Return the default on-disk cache directory for downloaded ATT&CK data."""
+    base = os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache')
+    return Path(base) / MITRE_CACHE_DIR_NAME
+
 
 class MitreAttackValidator:
     """
-    Validates technique IDs against the official MITRE ATT&CK framework.
-    
-    This class provides comprehensive validation of MITRE ATT&CK technique IDs,
-    ensuring that only legitimate techniques are included in analysis results.
-    It can fetch live data from the MITRE repository or fall back to format-only
-    validation when network access is unavailable.
-    
-    The validator follows a caching strategy to minimize network requests while
-    ensuring data freshness. It also provides detailed metadata about techniques
-    for enhanced reporting capabilities.
-    
-    Design Pattern: This class implements the Singleton pattern for the technique
-    data cache, ensuring consistent validation results across the application while
-    minimizing memory usage and network requests.
-    
+    Validates technique and tactic identifiers against ATT&CK data.
+
     Attributes:
-        valid_techniques: Set of all valid technique IDs from the framework
-        valid_tactics: Set of all valid tactic names from the framework  
-        technique_metadata: Detailed information about each technique
-        data_version: Version of ATT&CK data currently loaded
-        last_update: Timestamp of the last successful data fetch
-        cache_duration: How long cached data remains valid
+        valid_techniques: IDs of ACTIVE techniques (not revoked, not deprecated)
+        valid_tactics: Tactic short names from x-mitre-tactic objects
+        technique_metadata: Metadata for every technique seen, including inactive ones
+        revoked_by: Maps a revoked technique ID to the ID that replaced it
+        data_version: ATT&CK version of the loaded data (e.g. "20.1"), or None if unknown
+        data_source: Where the data came from (URL or file path)
     """
-    
-    def __init__(self, cache_duration_hours: int = 24):
-        """
-        Initialize the MITRE ATT&CK validator.
-        
-        Args:
-            cache_duration_hours: How long to keep cached ATT&CK data before refreshing
-        """
+
+    def __init__(self, cache_duration_hours: int = MITRE_CACHE_HOURS,
+                 cache_dir: Optional[str] = None, use_cache: bool = True):
         self.valid_techniques: Set[str] = set()
         self.valid_tactics: Set[str] = set()
+        self.tactic_names: Dict[str, str] = {}
         self.technique_metadata: Dict[str, Dict[str, Any]] = {}
+        self.revoked_by: Dict[str, str] = {}
         self.data_version: Optional[str] = None
+        self.data_source: Optional[str] = None
         self.last_update: Optional[datetime] = None
+        self.using_stale_cache: bool = False
         self.cache_duration = timedelta(hours=cache_duration_hours)
-        
-        # Network session configuration for robust HTTP requests
-        self._session: Optional[requests.Session] = None
+        self.cache_dir = Path(cache_dir) if cache_dir else default_cache_dir()
+        self.use_cache = use_cache
+
+        self._session: Optional["requests.Session"] = None
         if HAS_REQUESTS:
             self._configure_http_session()
-        
-        logger.debug(f"MITRE ATT&CK validator initialized with {cache_duration_hours}h cache duration")
-    
+
+        logger.debug(f"MITRE ATT&CK validator initialized (cache {cache_duration_hours}h, dir {self.cache_dir})")
+
+    # ------------------------------------------------------------------
+    # HTTP and caching
+    # ------------------------------------------------------------------
+
     def _configure_http_session(self) -> None:
-        """
-        Configure HTTP session with retry strategy and proper headers.
-        
-        This method sets up a robust HTTP client that can handle temporary
-        network issues and server problems gracefully. The retry strategy
-        helps ensure we can fetch ATT&CK data even when the MITRE servers
-        are experiencing high load or temporary outages.
-        """
-        if not HAS_REQUESTS:
-            logger.warning("Requests library not available - HTTP session not configured")
-            return
-        
+        """Configure an HTTP session that retries transient failures (429 and 5xx)."""
         self._session = requests.Session()
-        
-        # Configure retry strategy for resilient network requests
-        # This handles temporary network issues and server overload gracefully
+
         retry_strategy = Retry(
             total=HTTP_RETRY_ATTEMPTS,
-            status=HTTP_RETRY_STATUS_CODES,
+            status_forcelist=HTTP_RETRY_STATUS_CODES,
             allowed_methods=["HEAD", "GET", "OPTIONS"],
             backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
-            raise_on_status=False
+            respect_retry_after_header=True,
+            raise_on_status=False,
         )
-        
-        # Apply retry strategy to HTTP and HTTPS
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
-        
-        # Set appropriate headers for the MITRE API
         self._session.headers.update({
-            'User-Agent': 'Enterprise-MITRE-Analyzer/3.0.0 (Security Analysis Tool)',
+            'User-Agent': f'NavToGen/{VERSION} (ATT&CK coverage analysis)',
             'Accept': 'application/json',
-            'Accept-Encoding': 'gzip, deflate'
         })
-        
-        logger.debug("HTTP session configured with retry strategy")
-    
-    def fetch_mitre_data(self, force_refresh: bool = False) -> bool:
-        """
-        Fetch the latest MITRE ATT&CK data from the official repository.
-        
-        This method retrieves the complete ATT&CK framework data and processes it
-        into a format optimized for fast validation lookups. It implements intelligent
-        caching to minimize network requests while ensuring data freshness.
-        
-        The fetching process follows these steps:
-        1. Check if cached data is still valid (unless force_refresh is True)
-        2. Download the latest ATT&CK JSON data from MITRE's repository
-        3. Parse and validate the JSON structure
-        4. Extract techniques, tactics, and metadata
-        5. Build optimized lookup structures for validation
-        
-        Args:
-            force_refresh: If True, bypass cache and fetch fresh data
-            
-        Returns:
-            bool: True if data was successfully fetched and processed, False otherwise
-            
-        Raises:
-            None: All exceptions are caught and logged, allowing graceful degradation
-        """
-        # Check if we need to refresh the cache
-        if not force_refresh and self._is_cache_valid():
-            logger.debug("MITRE ATT&CK data cache is still valid, skipping fetch")
-            return True
-        
-        if not HAS_REQUESTS:
-            logger.warning("Requests library not available. Cannot fetch MITRE ATT&CK data.")
-            return False
-        
-        if not self._session:
-            logger.error("HTTP session not configured. Cannot fetch MITRE ATT&CK data.")
-            return False
-        
+
+    @property
+    def data_major_version(self) -> Optional[str]:
+        """Major ATT&CK version as a string (e.g. "20" for "20.1"), or None if unknown."""
+        if not self.data_version:
+            return None
+        return self.data_version.split('.')[0]
+
+    def _cache_paths(self, url: str) -> Tuple[Path, Path]:
+        key = hashlib.sha256(url.encode('utf-8')).hexdigest()[:16]
+        return self.cache_dir / f"attack-{key}.json", self.cache_dir / f"attack-{key}.meta.json"
+
+    def _read_cache_meta(self, meta_path: Path) -> Dict[str, Any]:
         try:
-            logger.info("Fetching latest MITRE ATT&CK data from official repository...")
-            start_time = datetime.now()
-            
-            # Make the HTTP request with timeout
-            response = self._session.get(MITRE_ATTACK_URL, timeout=MITRE_REQUEST_TIMEOUT)
-            
-            # Check if request was successful
+            return json.loads(meta_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return {}
+
+    def _write_cache(self, data_path: Path, meta_path: Path, content: bytes,
+                     etag: Optional[str]) -> None:
+        """Write cache files atomically; cache failures never fail the run."""
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(self.cache_dir), suffix='.tmp')
+            with os.fdopen(fd, 'wb') as f:
+                f.write(content)
+            os.replace(tmp, data_path)
+            meta_path.write_text(json.dumps({
+                'etag': etag,
+                'fetched_at': datetime.now().isoformat(),
+            }), encoding='utf-8')
+        except OSError as e:
+            logger.warning(f"Could not write ATT&CK cache: {e}")
+
+    def _resolve_versioned_url(self, version: str) -> Optional[str]:
+        """
+        Resolve a version such as "19" or "19.2" to a download URL using index.json.
+
+        "19" selects the newest 19.x release. Returns None if it cannot be resolved.
+        """
+        try:
+            response = self._session.get(MITRE_ATTACK_INDEX_URL, timeout=MITRE_REQUEST_TIMEOUT)
             if not response.ok:
-                logger.error(f"Failed to fetch MITRE ATT&CK data: HTTP {response.status_code}")
-                return False
-            
-            # Parse JSON response
-            try:
-                attack_data = response.json()
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON in MITRE ATT&CK data: {str(e)}")
-                return False
-            
-            # Validate basic structure
-            if not isinstance(attack_data, dict) or 'objects' not in attack_data:
-                logger.error("Invalid MITRE ATT&CK data structure: missing 'objects' field")
-                return False
-            
-            # Process the data
-            success = self._process_attack_data(attack_data)
-            if success:
-                self.last_update = datetime.now()
-                fetch_time = (datetime.now() - start_time).total_seconds()
-                
-                logger.info(f"Successfully loaded MITRE ATT&CK data in {fetch_time:.2f} seconds:")
-                logger.info(f"  - {len(self.valid_techniques)} techniques")
-                logger.info(f"  - {len(self.valid_tactics)} tactics")
-                logger.info(f"  - Data version: {self.data_version or 'Unknown'}")
-                
-                return True
-            else:
-                logger.error("Failed to process MITRE ATT&CK data")
-                return False
-            
-        except requests.exceptions.Timeout:
-            logger.error(f"Timeout fetching MITRE ATT&CK data (>{MITRE_REQUEST_TIMEOUT}s)")
-            return False
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Connection error fetching MITRE ATT&CK data: {str(e)}")
-            return False
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error fetching MITRE ATT&CK data: {str(e)}")
-            return False
+                logger.error(f"Could not fetch ATT&CK version index: HTTP {response.status_code}")
+                return None
+            index = response.json()
         except Exception as e:
-            logger.error(f"Unexpected error fetching MITRE ATT&CK data: {str(e)}")
-            return False
-    
-    def _is_cache_valid(self) -> bool:
+            logger.error(f"Could not fetch ATT&CK version index: {e}")
+            return None
+
+        for collection in index.get('collections', []):
+            if collection.get('name') != MITRE_ENTERPRISE_COLLECTION_NAME:
+                continue
+            # Versions are listed newest first
+            for entry in collection.get('versions', []):
+                v = str(entry.get('version', ''))
+                if v == version or v.startswith(version + '.'):
+                    return entry.get('url')
+        logger.error(f"ATT&CK version '{version}' not found in the version index")
+        return None
+
+    def fetch_mitre_data(self, force_refresh: bool = False, version: Optional[str] = None) -> bool:
         """
-        Check if the cached ATT&CK data is still valid based on age.
-        
+        Load ATT&CK data from the cache or the network.
+
+        Args:
+            force_refresh: Ignore a fresh cache and revalidate with the server
+            version: Optional ATT&CK version ("19" or "19.2") to load instead of the latest
+
         Returns:
-            bool: True if cache is valid and doesn't need refresh
+            bool: True if data is loaded (possibly from a stale cache), False otherwise
         """
+        if not force_refresh and self._is_cache_valid() and (
+                version is None or (self.data_version or '').split('.')[0] == version.split('.')[0]):
+            logger.debug("In-memory ATT&CK data is still valid")
+            return True
+
+        if not HAS_REQUESTS or not self._session:
+            logger.warning("Requests library not available. Cannot fetch ATT&CK data.")
+            return False
+
+        url = MITRE_ATTACK_URL
+        if version:
+            url = self._resolve_versioned_url(version)
+            if not url:
+                return False
+
+        data_path, meta_path = self._cache_paths(url)
+        meta = self._read_cache_meta(meta_path) if (self.use_cache and data_path.exists()) else {}
+
+        # Fresh on-disk cache: no network round trip at all
+        if meta.get('fetched_at') and not force_refresh:
+            try:
+                age = datetime.now() - datetime.fromisoformat(meta['fetched_at'])
+                if age < self.cache_duration:
+                    logger.info(f"Using cached ATT&CK data ({age.total_seconds() / 3600:.1f}h old)")
+                    return self._load_from_path(data_path, source=f"cache:{url}")
+            except ValueError:
+                pass
+
+        headers = {}
+        if meta.get('etag'):
+            headers['If-None-Match'] = meta['etag']
+
+        try:
+            logger.info(f"Fetching ATT&CK data from {url}")
+            response = self._session.get(url, timeout=MITRE_REQUEST_TIMEOUT, headers=headers)
+
+            if response.status_code == 304 and data_path.exists():
+                logger.info("ATT&CK data unchanged (HTTP 304); using cache")
+                self._write_cache(data_path, meta_path, data_path.read_bytes(), meta.get('etag'))
+                return self._load_from_path(data_path, source=f"cache:{url}")
+
+            if not response.ok:
+                logger.error(f"Failed to fetch ATT&CK data: HTTP {response.status_code}")
+                return self._fall_back_to_stale_cache(data_path, url)
+
+            if len(response.content) > MAX_ATTACK_DATA_BYTES:
+                logger.error("ATT&CK data download exceeds the size limit; refusing to parse it")
+                return False
+
+            try:
+                bundle = json.loads(response.content)
+            except ValueError as e:
+                logger.error(f"Invalid JSON in ATT&CK data: {e}")
+                return self._fall_back_to_stale_cache(data_path, url)
+
+            if not self._process_attack_data(bundle):
+                logger.error("Failed to process ATT&CK data")
+                return self._fall_back_to_stale_cache(data_path, url)
+
+            self.data_source = url
+            self.last_update = datetime.now()
+            self.using_stale_cache = False
+            if self.use_cache:
+                self._write_cache(data_path, meta_path, response.content, response.headers.get('ETag'))
+            self._log_loaded()
+            return True
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error fetching ATT&CK data: {e}")
+            return self._fall_back_to_stale_cache(data_path, url)
+        except Exception as e:
+            logger.error(f"Unexpected error fetching ATT&CK data: {e}")
+            return False
+
+    def _fall_back_to_stale_cache(self, data_path: Path, url: str) -> bool:
+        if self.use_cache and data_path.exists():
+            logger.warning("Using STALE cached ATT&CK data because the download failed")
+            if self._load_from_path(data_path, source=f"stale-cache:{url}"):
+                self.using_stale_cache = True
+                return True
+        return False
+
+    def load_from_file(self, file_path: str) -> bool:
+        """Load ATT&CK data from a local STIX bundle (STIX 2.0 or 2.1). Used for offline runs."""
+        return self._load_from_path(Path(file_path), source=str(file_path))
+
+    def _load_from_path(self, path: Path, source: str) -> bool:
+        try:
+            if path.stat().st_size > MAX_ATTACK_DATA_BYTES:
+                logger.error(f"ATT&CK data file too large: {path}")
+                return False
+            with open(path, 'r', encoding='utf-8') as f:
+                bundle = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.error(f"Could not read ATT&CK data from {path}: {e}")
+            return False
+
+        if not self._process_attack_data(bundle):
+            return False
+
+        self.data_source = source
+        self.last_update = datetime.now()
+        self._log_loaded()
+        return True
+
+    def _log_loaded(self) -> None:
+        logger.info(
+            f"ATT&CK data loaded: version {self.data_version or 'unknown'}, "
+            f"{len(self.valid_techniques)} active techniques, {len(self.valid_tactics)} tactics, "
+            f"{len(self.revoked_by)} revoked techniques with replacements"
+        )
+
+    def _is_cache_valid(self) -> bool:
+        """True if data is already loaded in memory and is younger than the cache duration."""
         if not self.last_update or not self.valid_techniques:
             return False
-        
-        age = datetime.now() - self.last_update
-        is_valid = age < self.cache_duration
-        
-        if not is_valid:
-            logger.debug(f"Cache expired: {age.total_seconds():.0f}s old (limit: {self.cache_duration.total_seconds():.0f}s)")
-        
-        return is_valid
-    
-    def _process_attack_data(self, attack_data: Dict[str, Any]) -> bool:
+        return (datetime.now() - self.last_update) < self.cache_duration
+
+    # ------------------------------------------------------------------
+    # Parsing the STIX bundle
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _attack_id(obj: Dict[str, Any]) -> Optional[str]:
+        for ref in obj.get('external_references', []):
+            if ref.get('source_name') == 'mitre-attack':
+                return ref.get('external_id')
+        return None
+
+    def _process_attack_data(self, attack_data: Any) -> bool:
         """
-        Process the raw ATT&CK JSON data into optimized validation structures.
-        
-        This method extracts the relevant information from the complex ATT&CK JSON
-        structure and organizes it for efficient validation lookups. The processing
-        handles various ATT&CK object types and relationships.
-        
-        Args:
-            attack_data: Raw ATT&CK JSON data from MITRE repository
-            
-        Returns:
-            bool: True if processing was successful, False otherwise
+        Build validation structures from a STIX bundle.
+
+        State is replaced only if parsing succeeds, so a failed load never leaves the
+        validator half-populated.
         """
-        try:
-            # Clear existing data
-            self.valid_techniques.clear()
-            self.valid_tactics.clear()
-            self.technique_metadata.clear()
-            
-            # Extract version information if available
-            self.data_version = attack_data.get('spec_version', 'Unknown')
-            
-            # Process all objects in the ATT&CK bundle
-            objects_processed = 0
-            techniques_found = 0
-            tactics_found = 0
-            
-            for obj in attack_data.get('objects', []):
-                objects_processed += 1
-                
-                # Process attack patterns (techniques)
-                if obj.get('type') == 'attack-pattern':
-                    if self._process_technique(obj):
-                        techniques_found += 1
-                
-                # Process kill chain phases (tactics) from x-mitre-matrix objects
-                elif obj.get('type') == 'x-mitre-matrix':
-                    tactics_found += self._process_matrix_tactics(obj)
-            
-            # Validate that we found reasonable amounts of data
-            if techniques_found < 100:  # ATT&CK has hundreds of techniques
-                logger.warning(f"Only found {techniques_found} techniques - data may be incomplete")
-            
-            if tactics_found < 10:  # ATT&CK has ~14 tactics
-                logger.warning(f"Only found {tactics_found} tactics - data may be incomplete")
-            
-            logger.debug(f"Processed {objects_processed} ATT&CK objects: {techniques_found} techniques, {tactics_found} tactics")
-            return techniques_found > 0 and tactics_found > 0
-            
-        except Exception as e:
-            logger.error(f"Error processing MITRE ATT&CK data: {str(e)}")
+        if not isinstance(attack_data, dict) or not isinstance(attack_data.get('objects'), list):
+            logger.error("Invalid ATT&CK data structure: missing 'objects' list")
             return False
-    
-    def _process_technique(self, technique_obj: Dict[str, Any]) -> bool:
-        """
-        Process a single technique object from the ATT&CK data.
-        
-        Args:
-            technique_obj: Individual technique object from ATT&CK JSON
-            
-        Returns:
-            bool: True if technique was successfully processed
-        """
+
+        valid_techniques: Set[str] = set()
+        valid_tactics: Set[str] = set()
+        tactic_names: Dict[str, str] = {}
+        metadata: Dict[str, Dict[str, Any]] = {}
+        id_by_stix: Dict[str, str] = {}
+        revoked_refs: Dict[str, str] = {}
+        version: Optional[str] = None
+
         try:
-            # Extract technique ID from external references
-            technique_id = None
-            for ref in technique_obj.get('external_references', []):
-                if ref.get('source_name') == 'mitre-attack':
-                    technique_id = ref.get('external_id')
-                    break
-            
-            if not technique_id or not technique_id.startswith('T'):
-                return False
-            
-            # Add to valid techniques set
-            self.valid_techniques.add(technique_id)
-            
-            # Extract metadata for this technique
-            metadata = {
-                'name': technique_obj.get('name', ''),
-                'description': technique_obj.get('description', ''),
-                'platforms': technique_obj.get('x_mitre_platforms', []),
-                'data_sources': technique_obj.get('x_mitre_data_sources', []),
-                'detection': technique_obj.get('x_mitre_detection', ''),
-                'tactics': [],
-                'is_sub_technique': '.' in technique_id,
-                'deprecated': technique_obj.get('x_mitre_deprecated', False),
-                'version': technique_obj.get('x_mitre_version', '1.0')
-            }
-            
-            # Extract associated tactics from kill chain phases
-            for phase in technique_obj.get('kill_chain_phases', []):
-                tactic_name = phase.get('phase_name')
-                if tactic_name:
-                    # Normalize tactic name
-                    normalized_tactic = tactic_name.replace('_', '-')
-                    metadata['tactics'].append(normalized_tactic)
-                    self.valid_tactics.add(normalized_tactic)
-            
-            # Store metadata
-            self.technique_metadata[technique_id] = metadata
-            
-            return True
-            
+            for obj in attack_data['objects']:
+                obj_type = obj.get('type')
+
+                if obj_type == 'attack-pattern':
+                    technique_id = self._attack_id(obj)
+                    if not technique_id or not technique_id.startswith('T'):
+                        continue
+
+                    revoked = bool(obj.get('revoked', False))
+                    deprecated = bool(obj.get('x_mitre_deprecated', False))
+                    id_by_stix[obj.get('id', '')] = technique_id
+
+                    tactics = [p.get('phase_name', '').replace('_', '-')
+                               for p in obj.get('kill_chain_phases', []) if p.get('phase_name')]
+
+                    metadata[technique_id] = {
+                        'name': obj.get('name', ''),
+                        'description': obj.get('description', ''),
+                        'platforms': obj.get('x_mitre_platforms', []),
+                        'data_sources': obj.get('x_mitre_data_sources', []),
+                        'detection': obj.get('x_mitre_detection', ''),
+                        'tactics': tactics,
+                        'is_sub_technique': bool(obj.get('x_mitre_is_subtechnique', '.' in technique_id)),
+                        'revoked': revoked,
+                        'deprecated': deprecated,
+                        'version': obj.get('x_mitre_version', '1.0'),
+                    }
+                    if not revoked and not deprecated:
+                        valid_techniques.add(technique_id)
+
+                elif obj_type == 'x-mitre-tactic':
+                    shortname = obj.get('x_mitre_shortname')
+                    if shortname and not obj.get('revoked') and not obj.get('x_mitre_deprecated'):
+                        valid_tactics.add(shortname)
+                        tactic_names[shortname] = obj.get('name', shortname)
+
+                elif obj_type == 'x-mitre-collection':
+                    if obj.get('name') in (None, MITRE_ENTERPRISE_COLLECTION_NAME) and obj.get('x_mitre_version'):
+                        version = str(obj['x_mitre_version'])
+
+                elif obj_type == 'relationship' and obj.get('relationship_type') == 'revoked-by':
+                    revoked_refs[obj.get('source_ref', '')] = obj.get('target_ref', '')
+
+            revoked_by: Dict[str, str] = {}
+            for source_stix, target_stix in revoked_refs.items():
+                source_id = id_by_stix.get(source_stix)
+                target_id = id_by_stix.get(target_stix)
+                if source_id and target_id:
+                    revoked_by[source_id] = target_id
         except Exception as e:
-            logger.warning(f"Error processing technique: {str(e)}")
+            logger.error(f"Error processing ATT&CK data: {e}")
             return False
-    
-    def _process_matrix_tactics(self, matrix_obj: Dict[str, Any]) -> int:
-        """
-        Process tactics from a matrix object.
-        
-        Args:
-            matrix_obj: Matrix object containing tactic definitions
-            
-        Returns:
-            int: Number of tactics processed
-        """
-        tactics_found = 0
-        
-        try:
-            for tactic_list in matrix_obj.get('tactic_refs', []):
-                if isinstance(tactic_list, list):
-                    for tactic_ref in tactic_list:
-                        # Extract tactic name from reference
-                        if isinstance(tactic_ref, str):
-                            # Tactic refs are usually in format like 'x-mitre-tactic--...'
-                            # We'll extract the actual tactic name from kill chain phases elsewhere
-                            pass
-        except Exception as e:
-            logger.warning(f"Error processing matrix tactics: {str(e)}")
-        
-        return tactics_found
-    
+
+        if not valid_techniques:
+            logger.error("No active techniques found in ATT&CK data")
+            return False
+        if not valid_tactics:
+            logger.error("No tactics (x-mitre-tactic objects) found in ATT&CK data")
+            return False
+
+        if len(valid_techniques) < 100:
+            logger.warning(f"Only {len(valid_techniques)} active techniques found - data may be incomplete")
+
+        # Commit
+        self.valid_techniques = valid_techniques
+        self.valid_tactics = valid_tactics
+        self.tactic_names = tactic_names
+        self.technique_metadata = metadata
+        self.revoked_by = revoked_by
+        self.data_version = version
+        if version is None:
+            logger.warning("ATT&CK data has no x-mitre-collection version (mitre/cti files do not); version unknown")
+        return True
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize(technique_id: str) -> str:
+        return technique_id.upper().strip()
+
+    def has_data(self) -> bool:
+        """True if real ATT&CK data is loaded (as opposed to format-only validation)."""
+        return bool(self.valid_techniques)
+
     def is_valid_technique(self, technique_id: str) -> bool:
         """
-        Check if a technique ID exists in the MITRE ATT&CK framework.
-        
-        This method provides the core validation functionality, checking whether
-        a given technique ID represents a legitimate ATT&CK technique. It falls
-        back to format validation if ATT&CK data hasn't been loaded.
-        
-        Args:
-            technique_id: Technique ID to validate (e.g., 'T1055', 'T1055.001')
-            
-        Returns:
-            bool: True if technique is valid, False otherwise
+        True if the technique exists and is active (not revoked or deprecated).
+
+        Without loaded data this falls back to checking only the ID format.
         """
         if not technique_id or not isinstance(technique_id, str):
             return False
-        
-        normalized_id = technique_id.upper().strip()
-        
-        # If we have loaded ATT&CK data, use it for validation
+        normalized = self._normalize(technique_id)
         if self.valid_techniques:
-            is_valid = normalized_id in self.valid_techniques
-            
-            # Log validation results for debugging
-            if is_valid:
-                logger.debug(f"Technique validated against ATT&CK data: {normalized_id}")
-            else:
-                logger.debug(f"Technique not found in ATT&CK data: {normalized_id}")
-            
-            return is_valid
-        
-        else:
-            # Fall back to format validation only
-            logger.debug(f"No ATT&CK data loaded, using format validation for: {normalized_id}")
-            return self._validate_technique_format(normalized_id)
-    
+            return normalized in self.valid_techniques
+        return self._validate_technique_format(normalized)
+
+    def is_known_technique(self, technique_id: str) -> bool:
+        """True if the ID exists in the data at all, including revoked and deprecated ones."""
+        return bool(technique_id) and self._normalize(technique_id) in self.technique_metadata
+
+    def is_revoked(self, technique_id: str) -> bool:
+        info = self.technique_metadata.get(self._normalize(technique_id or ''))
+        return bool(info and info['revoked'])
+
+    def is_deprecated(self, technique_id: str) -> bool:
+        info = self.technique_metadata.get(self._normalize(technique_id or ''))
+        return bool(info and info['deprecated'])
+
+    def resolve_revoked(self, technique_id: str) -> Optional[str]:
+        """
+        Follow revoked-by links to the active technique that replaced a revoked one.
+
+        Returns None if the technique is not revoked, has no replacement, or the chain
+        does not end in an active technique.
+        """
+        current = self._normalize(technique_id or '')
+        if not self.is_revoked(current):
+            return None
+        seen = {current}
+        for _ in range(_MAX_REVOKED_CHAIN):
+            nxt = self.revoked_by.get(current)
+            if not nxt or nxt in seen:
+                return None
+            if nxt in self.valid_techniques:
+                return nxt
+            seen.add(nxt)
+            current = nxt
+        return None
+
     def is_valid_tactic(self, tactic: str) -> bool:
-        """
-        Check if a tactic name is valid in the MITRE ATT&CK framework.
-        
-        Args:
-            tactic: Tactic name to validate (normalized format expected)
-            
-        Returns:
-            bool: True if tactic is valid, False otherwise
-        """
+        """True if the (already normalized) tactic short name is valid in the loaded data."""
         if not tactic or not isinstance(tactic, str):
             return False
-        
-        normalized_tactic = tactic.lower().strip().replace(' ', '-').replace('_', '-')
-        
+        normalized = tactic.lower().strip()
         if self.valid_tactics:
-            return normalized_tactic in self.valid_tactics
-        else:
-            # Fall back to basic format checking
-            return len(normalized_tactic) > 0 and normalized_tactic.replace('-', '').isalpha()
-    
+            return normalized in self.valid_tactics
+        return len(normalized) > 0 and normalized.replace('-', '').isalpha()
+
     def get_technique_info(self, technique_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get detailed metadata for a specific technique.
-        
-        This method returns comprehensive information about a technique,
-        including its name, description, associated tactics, platforms,
-        and other metadata from the ATT&CK framework.
-        
-        Args:
-            technique_id: Technique ID to look up
-            
-        Returns:
-            Dict[str, Any]: Technique metadata, or None if not found
-        """
+        """Metadata for a technique (including revoked and deprecated ones), or None."""
         if not technique_id:
             return None
-        
-        normalized_id = technique_id.upper().strip()
-        return self.technique_metadata.get(normalized_id)
-    
+        return self.technique_metadata.get(self._normalize(technique_id))
+
     def get_techniques_by_tactic(self, tactic: str) -> Set[str]:
-        """
-        Get all techniques associated with a specific tactic.
-        
-        Args:
-            tactic: Tactic name (normalized format)
-            
-        Returns:
-            Set[str]: Set of technique IDs associated with this tactic
-        """
-        if not self.technique_metadata:
-            return set()
-        
-        normalized_tactic = tactic.lower().strip().replace(' ', '-').replace('_', '-')
-        techniques = set()
-        
-        for technique_id, metadata in self.technique_metadata.items():
-            if normalized_tactic in metadata.get('tactics', []):
-                techniques.add(technique_id)
-        
-        return techniques
-    
+        """Active techniques associated with a tactic short name."""
+        normalized = tactic.lower().strip().replace(' ', '-').replace('_', '-')
+        return {tid for tid, meta in self.technique_metadata.items()
+                if tid in self.valid_techniques and normalized in meta.get('tactics', [])}
+
+    def known_platforms(self) -> Set[str]:
+        """Platform names (e.g. 'Windows', 'Identity Provider') used by active techniques."""
+        platforms: Set[str] = set()
+        for technique_id in self.valid_techniques:
+            platforms.update(self.technique_metadata[technique_id].get('platforms', []))
+        return platforms
+
+    def validate_technique_list(self, technique_ids: Set[str]) -> Tuple[Set[str], Set[str]]:
+        """Split technique IDs into (valid, invalid)."""
+        valid, invalid = set(), set()
+        for technique_id in technique_ids:
+            if self.is_valid_technique(technique_id):
+                valid.add(self._normalize(technique_id))
+            else:
+                invalid.add(technique_id)
+        return valid, invalid
+
     def get_validation_summary(self) -> Dict[str, Any]:
-        """
-        Get a summary of the current validation state.
-        
-        This method provides useful information about the validator's current
-        state, including data freshness, coverage, and validation statistics.
-        
-        Returns:
-            Dict[str, Any]: Summary information about the validator state
-        """
-        summary = {
-            'has_attack_data': len(self.valid_techniques) > 0,
+        """Summary of the validator state, suitable for logs and reports."""
+        sub_count = sum(1 for t in self.valid_techniques if self.technique_metadata[t]['is_sub_technique'])
+        summary: Dict[str, Any] = {
+            'has_attack_data': self.has_data(),
             'technique_count': len(self.valid_techniques),
             'tactic_count': len(self.valid_tactics),
             'data_version': self.data_version,
+            'data_source': self.data_source,
+            'using_stale_cache': self.using_stale_cache,
             'last_update': self.last_update.isoformat() if self.last_update else None,
-            'cache_valid': self._is_cache_valid(),
-            'validation_mode': 'online' if self.valid_techniques else 'format_only'
+            'validation_mode': 'attack_data' if self.has_data() else 'format_only',
+            'sub_techniques': sub_count,
+            'main_techniques': len(self.valid_techniques) - sub_count,
+            'revoked_techniques': sum(1 for m in self.technique_metadata.values() if m['revoked']),
+            'deprecated_techniques': sum(1 for m in self.technique_metadata.values() if m['deprecated']),
         }
-        
-        # Add cache age information
-        if self.last_update:
-            cache_age = datetime.now() - self.last_update
-            summary['cache_age_hours'] = cache_age.total_seconds() / 3600
-        
-        # Add some statistics about the data
-        if self.technique_metadata:
-            deprecated_count = sum(1 for meta in self.technique_metadata.values() 
-                                 if meta.get('deprecated', False))
-            sub_technique_count = sum(1 for meta in self.technique_metadata.values()
-                                    if meta.get('is_sub_technique', False))
-            
-            summary['deprecated_techniques'] = deprecated_count
-            summary['sub_techniques'] = sub_technique_count
-            summary['main_techniques'] = len(self.valid_techniques) - sub_technique_count
-        
         return summary
-    
-    def validate_technique_list(self, technique_ids: Set[str]) -> Tuple[Set[str], Set[str]]:
-        """
-        Validate a list of technique IDs and separate valid from invalid.
-        
-        This method is useful for batch validation of techniques extracted
-        from rules, allowing you to identify and handle invalid techniques
-        appropriately.
-        
-        Args:
-            technique_ids: Set of technique IDs to validate
-            
-        Returns:
-            Tuple[Set[str], Set[str]]: (valid_techniques, invalid_techniques)
-        """
-        valid_techniques = set()
-        invalid_techniques = set()
-        
-        for technique_id in technique_ids:
-            if self.is_valid_technique(technique_id):
-                valid_techniques.add(technique_id.upper().strip())
-            else:
-                invalid_techniques.add(technique_id)
-        
-        return valid_techniques, invalid_techniques
-    
+
     @staticmethod
     def _validate_technique_format(technique_id: str) -> bool:
-        """
-        Validate technique ID format without requiring ATT&CK data.
-        
-        This static method provides format validation as a fallback when
-        the full ATT&CK dataset isn't available.
-        
-        Args:
-            technique_id: Technique ID to validate
-            
-        Returns:
-            bool: True if format is correct, False otherwise
-        """
         if not technique_id or not isinstance(technique_id, str):
             return False
-        
-        # Use the same pattern as in the DetectionRule class
-        pattern = r'^T\d{4}(\.\d{3})?$'
-        return bool(re.match(pattern, technique_id.upper().strip()))
-    
+        return bool(_TECHNIQUE_FORMAT.match(technique_id.upper().strip()))
+
     def __str__(self) -> str:
-        """Provide a clean string representation for logging."""
         if self.valid_techniques:
-            return f"MitreAttackValidator(techniques={len(self.valid_techniques)}, tactics={len(self.valid_tactics)})"
-        else:
-            return "MitreAttackValidator(no_data_loaded)"
+            return (f"MitreAttackValidator(version={self.data_version}, "
+                    f"techniques={len(self.valid_techniques)}, tactics={len(self.valid_tactics)})")
+        return "MitreAttackValidator(no_data_loaded)"

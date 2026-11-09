@@ -30,7 +30,7 @@ from typing import Dict, List, Set, Optional, Any, Tuple
 import math
 
 from models.detection_rule import DetectionRule
-from models.navigator_layer_model import NavigatorLayer, TechniqueEntry
+from models.navigator_layer_model import LayerFilter, NavigatorLayer, TechniqueEntry
 from validators.mitre_validator import MitreAttackValidator
 from config import (
     COVERAGE_COLORS, 
@@ -67,32 +67,49 @@ class NavigatorLayerGenerator:
         scoring_algorithms: Available scoring algorithms for coverage visualization
     """
     
-    def __init__(self, mitre_validator: Optional[MitreAttackValidator] = None):
+    def __init__(self, mitre_validator: Optional[MitreAttackValidator] = None,
+                 attack_version: Optional[str] = None,
+                 platforms: Optional[List[str]] = None,
+                 tactic_scoped: bool = False):
         """
-        Initialize the Navigator layer generator.
-        
         Args:
-            mitre_validator: Optional MITRE ATT&CK validator for enhanced technique metadata
+            mitre_validator: Optional validator for enhanced technique metadata
+            attack_version: ATT&CK major version to stamp on every layer. Defaults to the
+                loaded ATT&CK data's major version, then to the configured default.
+            platforms: Optional ATT&CK platform names to filter layers to (opt-in; no
+                filter is applied when omitted)
+            tactic_scoped: Emit one entry per (technique, tactic) pair when the rule
+                declared the tactic (Elastic does), so multi-tactic techniques are not
+                coloured under every tactic. Techniques without pairing stay unscoped.
         """
         self.mitre_validator = mitre_validator
-        self.default_attack_version = DEFAULT_ATTACK_VERSION
-        
-        # Available scoring algorithms for different visualization needs
+        self.tactic_scoped = tactic_scoped
+        self.platforms = list(platforms) if platforms else []
+
+        data_version = mitre_validator.data_major_version if mitre_validator else None
+        resolved_version = attack_version or data_version or DEFAULT_ATTACK_VERSION
+        self.default_attack_version = self._validate_attack_version(resolved_version)
+
         self.scoring_algorithms = {
             'linear': self._linear_scoring,
             'logarithmic': self._logarithmic_scoring,
             'threshold': self._threshold_scoring,
             'frequency': self._frequency_scoring
         }
-        
-        logger.debug("Navigator layer generator initialized")
-        if mitre_validator:
-            logger.debug("Enhanced metadata generation enabled via MITRE ATT&CK validator")
-    
+
+        logger.debug(f"Navigator layer generator initialized (ATT&CK {self.default_attack_version})")
+
+    def _new_layer(self, name: str, description: str) -> NavigatorLayer:
+        """Create a layer with this generator's ATT&CK version and optional platform filter."""
+        layer = NavigatorLayer(name=name, description=description,
+                               attack_version=self.default_attack_version)
+        if self.platforms:
+            layer.layer_filter = LayerFilter(platforms=list(self.platforms))
+        return layer
+
     def generate_coverage_layer(self, rules: List[DetectionRule], 
                                layer_name: str = "Detection Coverage Analysis",
                                description: str = "",
-                               attack_version: str = None,
                                scoring_algorithm: str = 'threshold') -> NavigatorLayer:
         """
         Generate a coverage analysis layer showing detection rule coverage across techniques.
@@ -110,7 +127,6 @@ class NavigatorLayerGenerator:
             rules: List of detection rules to analyze
             layer_name: Name for the generated layer
             description: Description text for the layer
-            attack_version: MITRE ATT&CK version to reference
             scoring_algorithm: Algorithm to use for coverage scoring
             
         Returns:
@@ -121,9 +137,6 @@ class NavigatorLayerGenerator:
         """
         if not rules:
             raise ValueError("No rules provided for layer generation")
-        
-        # Validate and set attack version
-        attack_version = self._validate_attack_version(attack_version)
         
         # Validate scoring algorithm
         if scoring_algorithm not in self.scoring_algorithms:
@@ -139,10 +152,9 @@ class NavigatorLayerGenerator:
             raise ValueError("No MITRE ATT&CK techniques found in the provided rules")
         
         # Create the base layer
-        layer = NavigatorLayer(
-            name=layer_name,
-            description=description or self._generate_default_description(rules, "coverage"),
-            attack_version=attack_version
+        layer = self._new_layer(
+            layer_name,
+            description or self._generate_default_description(rules, "coverage")
         )
         
         # Set up appropriate legend for coverage analysis
@@ -151,26 +163,30 @@ class NavigatorLayerGenerator:
         # Generate technique entries with scoring
         scoring_func = self.scoring_algorithms[scoring_algorithm]
         
-        for technique_id, data in technique_data.items():
+        known_ids = {key[0] for key in technique_data}
+        for (technique_id, tactic), data in technique_data.items():
             # Calculate score and color based on rule coverage
             score, color = scoring_func(data['rule_count'])
             
             # Create technique entry with rich metadata
             technique_entry = TechniqueEntry(
                 technique_id=technique_id,
+                tactic=tactic,
                 score=score,
                 color=color,
                 comment=self._generate_technique_comment(technique_id, data, "coverage"),
-                show_subtechniques=self._should_show_subtechniques(technique_id, technique_data)
+                show_subtechniques=self._should_show_subtechniques(technique_id, known_ids)
             )
             
             # Add metadata for enhanced tooltips
             self._add_coverage_metadata(technique_entry, data)
+            if tactic:
+                technique_entry.add_metadata("Tactic", tactic)
             
             layer.add_technique_entry(technique_entry)
         
-        # Sort techniques for consistent output
-        layer.sort_techniques(by_score=False)  # Sort by technique ID for browsing
+        # Sort techniques for consistent output (by ID, then tactic)
+        layer.techniques.sort(key=lambda t: (t.technique_id, t.tactic or ""))
         
         logger.info(f"Generated coverage layer with {layer.get_technique_count()} techniques")
         return layer
@@ -216,14 +232,13 @@ class NavigatorLayerGenerator:
         sentinel_only = sentinel_techniques - elastic_techniques
         
         # Create the comparison layer
-        layer = NavigatorLayer(
-            name=layer_name,
-            description=self._generate_comparison_description(
+        layer = self._new_layer(
+            layer_name,
+            self._generate_comparison_description(
                 len(elastic_rules), len(sentinel_rules),
                 len(elastic_techniques), len(sentinel_techniques),
                 len(both_platforms), len(elastic_only), len(sentinel_only)
-            ),
-            attack_version=self.default_attack_version
+            )
         )
         
         # Set up comparison legend
@@ -255,7 +270,7 @@ class NavigatorLayerGenerator:
                 score=score,
                 color=color,
                 comment=comment,
-                show_subtechniques=self._should_show_subtechniques(technique_id, {t: {} for t in all_techniques})
+                show_subtechniques=self._should_show_subtechniques(technique_id, all_techniques)
             )
             
             # Add comparison-specific metadata
@@ -313,11 +328,10 @@ class NavigatorLayerGenerator:
             max_frequency = max(technique_frequency.values())
         
         # Create the frequency layer
-        layer = NavigatorLayer(
-            name=layer_name,
-            description=f"Technique frequency analysis across {len(rules)} rules. "
-                       f"Shows how often each technique appears (max: {max_frequency} occurrences).",
-            attack_version=self.default_attack_version
+        layer = self._new_layer(
+            layer_name,
+            f"Technique frequency analysis across {len(rules)} rules. "
+            f"Shows how often each technique appears (max: {max_frequency} occurrences)."
         )
         
         # Set up frequency-based legend
@@ -344,7 +358,7 @@ class NavigatorLayerGenerator:
                 score=normalized_score,
                 color=color,
                 comment=f"Appears in {frequency} rules ({frequency/len(rules)*100:.1f}% of total)",
-                show_subtechniques=self._should_show_subtechniques(technique_id, technique_frequency)
+                show_subtechniques=self._should_show_subtechniques(technique_id, set(technique_frequency))
             )
             
             # Add frequency metadata
@@ -362,48 +376,40 @@ class NavigatorLayerGenerator:
         logger.info(f"Generated frequency layer with {len(technique_frequency)} techniques (max frequency: {max_frequency})")
         return layer
     
-    def _aggregate_technique_data(self, rules: List[DetectionRule]) -> Dict[str, Dict[str, Any]]:
+    def _aggregate_technique_data(self, rules: List[DetectionRule]) -> Dict[Tuple[str, Optional[str]], Dict[str, Any]]:
         """
-        Aggregate technique information from all rules for comprehensive analysis.
-        
-        Args:
-            rules: List of detection rules to analyze
-            
-        Returns:
-            Dict[str, Dict[str, Any]]: Aggregated technique data with statistics
+        Aggregate per-technique statistics across rules.
+
+        Keys are (technique_id, tactic). ``tactic`` is None unless tactic scoping is on
+        and the rule declared the tactic for that technique.
         """
-        technique_data = {}
-        
+        technique_data: Dict[Tuple[str, Optional[str]], Dict[str, Any]] = {}
+
         for rule in rules:
             for technique_id in rule.techniques:
-                if technique_id not in technique_data:
-                    technique_data[technique_id] = {
+                tactics = sorted(rule.technique_tactics.get(technique_id, ())) if self.tactic_scoped else []
+                for tactic in (tactics or [None]):
+                    data = technique_data.setdefault((technique_id, tactic), {
                         'rule_count': 0,
                         'rules': [],
                         'platforms': set(),
                         'severities': set(),
                         'tactics': set(),
                         'rule_types': set()
-                    }
-                
-                data = technique_data[technique_id]
-                data['rule_count'] += 1
-                data['rules'].append(rule.name)
-                data['platforms'].add(rule.rule_type.split('-')[0])  # Extract platform (elastic/sentinel)
-                data['severities'].add(rule.severity)
-                data['tactics'].update(rule.tactics)
-                
-                # Extract rule type for additional context
-                if '-' in rule.rule_type:
-                    data['rule_types'].add(rule.rule_type.split('-', 1)[1])
-        
-        # Convert sets to lists for JSON serialization and easier handling
+                    })
+                    data['rule_count'] += 1
+                    data['rules'].append(rule.name)
+                    data['platforms'].add(rule.rule_type.split('-')[0])  # elastic / sentinel
+                    data['severities'].add(rule.severity)
+                    data['tactics'].update(rule.tactics)
+                    if '-' in rule.rule_type:
+                        data['rule_types'].add(rule.rule_type.split('-', 1)[1])
+
+        # Sorted lists: deterministic output and JSON-friendly
         for data in technique_data.values():
-            data['platforms'] = list(data['platforms'])
-            data['severities'] = list(data['severities'])
-            data['tactics'] = list(data['tactics'])
-            data['rule_types'] = list(data['rule_types'])
-        
+            for key in ('platforms', 'severities', 'tactics', 'rule_types'):
+                data[key] = sorted(data[key])
+
         return technique_data
     
     def _extract_technique_set(self, rules: List[DetectionRule]) -> Set[str]:
@@ -531,26 +537,12 @@ class NavigatorLayerGenerator:
         if tech_info.get('is_sub_technique'):
             technique_entry.add_metadata("Type", "Sub-technique")
     
-    def _should_show_subtechniques(self, technique_id: str, technique_data: Dict[str, Any]) -> bool:
-        """
-        Determine if subtechniques should be expanded for a parent technique.
-        
-        Args:
-            technique_id: Technique ID to check
-            technique_data: Dictionary of all technique data
-            
-        Returns:
-            bool: True if subtechniques should be shown expanded
-        """
+    def _should_show_subtechniques(self, technique_id: str, known_ids: Set[str]) -> bool:
+        """True if this parent technique has at least one covered sub-technique."""
         if '.' in technique_id:
-            return False  # This is already a subtechnique
-        
-        # Check if we have any subtechniques for this parent technique
-        for other_id in technique_data.keys():
-            if other_id.startswith(f"{technique_id}."):
-                return True
-        
-        return False
+            return False  # Already a sub-technique
+        prefix = f"{technique_id}."
+        return any(other.startswith(prefix) for other in known_ids)
     
     def _generate_default_description(self, rules: List[DetectionRule], layer_type: str) -> str:
         """
@@ -595,24 +587,13 @@ class NavigatorLayerGenerator:
                 f"Shared coverage: {shared_count} techniques. "
                 f"Platform-specific: {elastic_only_count} Elastic-only, {sentinel_only_count} Sentinel-only.")
     
-    def _validate_attack_version(self, attack_version: Optional[str]) -> str:
-        """
-        Validate and normalize ATT&CK version.
-        
-        Args:
-            attack_version: Version string to validate
-            
-        Returns:
-            str: Validated version string
-        """
-        if attack_version is None:
-            return self.default_attack_version
-        
-        if validate_attack_version(attack_version):
-            return attack_version
-        else:
-            logger.warning(f"Invalid ATT&CK version '{attack_version}', using default '{self.default_attack_version}'")
-            return self.default_attack_version
+    @staticmethod
+    def _validate_attack_version(attack_version: Optional[str]) -> str:
+        """Return the version if it is valid, otherwise the configured default."""
+        if attack_version and validate_attack_version(str(attack_version).split('.')[0]):
+            return str(attack_version).split('.')[0]
+        logger.warning(f"Invalid ATT&CK version '{attack_version}', using default '{DEFAULT_ATTACK_VERSION}'")
+        return DEFAULT_ATTACK_VERSION
     
     # Scoring algorithm implementations
     

@@ -10,24 +10,32 @@ behavior across the application, you can do it from this single location.
 """
 
 import re
-from typing import Set
 
 # Version information - used for tracking and compatibility
 VERSION = "3.0.0"
-APPLICATION_NAME = "Enterprise MITRE ATT&CK Coverage Analyzer"
+APPLICATION_NAME = "NavToGen - MITRE ATT&CK Coverage Analyzer"
 
 # Security constraints - these limits prevent various attack vectors
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB per file limit (prevents memory exhaustion)
 MAX_DIRECTORY_DEPTH = 10          # Maximum recursion depth (prevents directory traversal DoS)
 MAX_WORKERS = 4                   # Thread pool size for concurrent processing
 
-# MITRE ATT&CK data source - official repository URL
-MITRE_ATTACK_URL = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
-MITRE_REQUEST_TIMEOUT = 30        # Timeout for HTTP requests in seconds
+# MITRE ATT&CK data source.
+# attack-stix-data (STIX 2.1) is used because it ships an x-mitre-collection object that
+# carries the real ATT&CK version, plus an index.json listing every versioned release.
+# (mitre/cti is STIX 2.0 and exposes no version, so it is only supported as a local file.)
+MITRE_ATTACK_URL = "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/enterprise-attack/enterprise-attack.json"
+MITRE_ATTACK_INDEX_URL = "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/index.json"
+MITRE_ENTERPRISE_COLLECTION_NAME = "Enterprise ATT&CK"
+MITRE_REQUEST_TIMEOUT = 60        # Timeout for HTTP requests in seconds (file is ~50MB)
+MAX_ATTACK_DATA_BYTES = 200 * 1024 * 1024  # Refuse to parse ATT&CK data larger than this
+MITRE_CACHE_HOURS = 24            # Cached ATT&CK data is reused without a network round trip for this long
+MITRE_CACHE_DIR_NAME = "navtogen"  # Subdirectory of the user cache dir (XDG_CACHE_HOME or ~/.cache)
 
 # File processing settings
-SUPPORTED_EXTENSIONS = {'.yaml', '.yml', '.json'}  # File types we can process
-ENCODING = 'utf-8'                # Standard encoding for all file operations
+# File types we can process. Elastic detection-rules uses TOML; Kibana exports are NDJSON.
+SUPPORTED_EXTENSIONS = {'.yaml', '.yml', '.json', '.toml', '.ndjson', '.jsonl'}
+ENCODING = 'utf-8-sig'            # UTF-8, tolerating a leading byte-order mark
 
 # Regular expressions for pattern matching
 # The word boundaries (\b) ensure we match complete technique IDs, not partial strings
@@ -36,37 +44,48 @@ TECHNIQUE_ID_PATTERN = re.compile(r'\bT\d{4}(?:\.\d{3})?\b')
 # Navigator layer format constants
 NAVIGATOR_VERSION = "5.1.1"
 LAYER_VERSION = "4.5"
-DEFAULT_ATTACK_VERSION = "17"
+DEFAULT_ATTACK_VERSION = "20"  # Used only when no ATT&CK data was loaded (major version, as a string)
 
-# Valid MITRE ATT&CK tactics (normalized names)
-# These represent the standard phases of a cyber attack lifecycle
-VALID_TACTICS = {
-    'reconnaissance',      # Gathering information about the target
-    'resource-development', # Establishing resources for operations
-    'initial-access',      # Getting into the network
-    'execution',          # Running malicious code
-    'persistence',        # Maintaining foothold
-    'privilege-escalation', # Gaining higher-level permissions
-    'defense-evasion',    # Avoiding detection
-    'credential-access',  # Obtaining account credentials
-    'discovery',          # Learning about the environment
-    'lateral-movement',   # Moving through the network
-    'collection',         # Gathering data of interest
-    'command-and-control', # Communicating with compromised systems
-    'exfiltration',       # Stealing data
-    'impact'              # Manipulating, interrupting, or destroying systems
+# Valid MITRE ATT&CK tactics (normalized, hyphenated short names).
+# ATT&CK v19 (April 2026) split Defense Evasion into Stealth and Defense Impairment.
+# Defense Evasion is kept as a legacy name because rules written before v19 still use it.
+# When ATT&CK data is loaded, the validator's tactic list (from x-mitre-tactic objects)
+# takes precedence over this static fallback.
+CURRENT_TACTICS = {
+    'reconnaissance',
+    'resource-development',
+    'initial-access',
+    'execution',
+    'persistence',
+    'privilege-escalation',
+    'stealth',
+    'defense-impairment',
+    'credential-access',
+    'discovery',
+    'lateral-movement',
+    'collection',
+    'command-and-control',
+    'exfiltration',
+    'impact'
 }
+LEGACY_TACTICS = {'defense-evasion'}
+VALID_TACTICS = CURRENT_TACTICS | LEGACY_TACTICS
 
-# Security validation patterns
-# These help identify potentially dangerous file paths that should be blocked
-FORBIDDEN_PATH_PATTERNS = [
-    '/etc/',                    # Unix system configuration
-    '/proc/',                   # Unix process information
-    '/sys/',                    # Unix system information
-    '\\Windows\\System32\\',    # Windows system directory
-    '\\Windows\\SysWOW64\\',   # Windows 32-bit system directory
-    '/root/',                   # Unix root user home
-    '/var/log/',               # Unix system logs
+# Security validation: system locations that are never read from or written to.
+# These are matched as path PREFIXES of the fully resolved path (component-wise), so
+# /home/me/etc/rules is fine while /etc/passwd is not. /root is intentionally not listed:
+# the tool only reads rule files, and refusing the home directory of the account that
+# runs it (common in containers) is a usability bug, not protection.
+FORBIDDEN_PATH_PREFIXES = [
+    '/etc',
+    '/private/etc',      # macOS: /etc is a symlink to /private/etc
+    '/proc',
+    '/sys',
+    '/dev',
+    '/boot',
+    '/var/log',
+    '/private/var/log',
+    'C:/Windows',
 ]
 
 # Logging configuration
@@ -84,28 +103,6 @@ COVERAGE_COLORS = {
     'both_platforms': '#00ff00'    # Bright green for shared coverage
 }
 
-# Platform detection indicators
-# These strings help identify which SIEM platform a rule belongs to
-ELASTIC_INDICATORS = [
-    'rule_id:',
-    'risk_score:',
-    'threat:',
-    'type: eql',
-    'type: query',
-    'from: now',
-    'index:'
-]
-
-SENTINEL_INDICATORS = [
-    'Microsoft.SecurityInsights',
-    'displayName:',
-    'alertRuleTemplateName:',
-    'kind: Scheduled',
-    'kind: NRT',
-    'queryFrequency:',
-    'triggerOperator:'
-]
-
 # HTTP request configuration for MITRE ATT&CK data fetching
 HTTP_RETRY_ATTEMPTS = 3
 HTTP_RETRY_BACKOFF_FACTOR = 1
@@ -122,28 +119,25 @@ def get_banner() -> str:
 {'='*60}
 {APPLICATION_NAME} v{VERSION}
 {'='*60}
-Enterprise-grade MITRE ATT&CK coverage analysis for
-Elastic SIEM and Microsoft Sentinel detection rules.
+MITRE ATT&CK coverage analysis for Elastic Security
+and Microsoft Sentinel detection rules.
 {'='*60}
 """
     return banner
 
 def validate_attack_version(version: str) -> bool:
     """
-    Validates that an ATT&CK version string is reasonable.
-    
+    Validate an ATT&CK version string: a major version ("20") or major.minor ("19.2").
+
     Args:
-        version: Version string to validate (e.g., "17", "16", "15")
-        
+        version: Version string to validate
+
     Returns:
-        bool: True if version appears valid, False otherwise
+        bool: True if the format is valid and the major version is in a sane range
     """
-    try:
-        # ATT&CK versions are typically integers between 1 and 20 (reasonable range)
-        version_num = int(version)
-        return 1 <= version_num <= 50  # Allow some future-proofing
-    except ValueError:
+    if not isinstance(version, str) or not re.fullmatch(r'\d{1,3}(\.\d{1,3})?', version.strip()):
         return False
+    return 1 <= int(version.strip().split('.')[0]) <= 50  # Allow some future-proofing
 
 def get_file_size_limit_mb() -> int:
     """

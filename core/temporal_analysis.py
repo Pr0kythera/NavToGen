@@ -1,751 +1,575 @@
 """
 Temporal Analysis and Comparison Module
-======================================
+=======================================
 
-This module provides functionality for comparing multiple Navigator layer JSON files
-and detailed coverage reports across different time periods. It enables tracking
-detection coverage growth, rule development velocity, and overall security posture
-improvement over time.
+Compares coverage snapshots taken at different times to show trends: rule growth,
+technique and tactic coverage growth, and development velocity.
 
-The module generates time-series data suitable for executive reporting to CISOs,
-showing metrics such as:
-- Detection rule growth trends
-- MITRE ATT&CK coverage expansion
-- Tactic-specific coverage improvements
-- Platform-specific detection development
+Snapshot sources
+----------------
+- **Coverage reports** (``--report`` output): the preferred input. They contain exact rule
+  counts, per-technique frequencies, tactic coverage and the ATT&CK data facts needed to
+  compute coverage percentages against the real number of techniques.
+- **Navigator layers**: accepted, but a layer does not record how many rules exist, so
+  rule counts are reported as unknown (``None``) rather than guessed.
 
-Key capabilities:
-- Multi-file comparison analysis
-- Time-series data extraction from snapshots
-- Executive summary generation for leadership
-- CSV/Excel-compatible tabular output for charting
-- Statistical trend analysis and projections
+Files in a snapshot directory are classified by CONTENT. Anything that is neither a
+coverage report nor a Navigator layer (for example this tool's own executive summaries
+or time-series files) is skipped, so a directory can safely contain other JSON files.
 """
 
+import csv
 import json
 import logging
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Any, Tuple, Optional, Union
-from dataclasses import dataclass, field
-from collections import defaultdict
-import csv
 import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+MAX_SNAPSHOT_FILE_BYTES = 50 * 1024 * 1024
+MAX_TOTAL_BYTES = 500 * 1024 * 1024
+
+# Used only when a snapshot carries no ATT&CK data facts. ATT&CK v20 Enterprise has
+# 706 active techniques (227 techniques + 479 sub-techniques) and 15 tactics.
+FALLBACK_TOTAL_TECHNIQUES = 706
+FALLBACK_TOTAL_TACTICS = 15
+
+
+def _to_naive_utc(value: datetime) -> datetime:
+    """Normalize timestamps so aware and naive values can be compared and sorted."""
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _delta(newer: Optional[float], older: Optional[float]) -> Optional[float]:
+    """Difference that propagates 'unknown': None if either side is unknown."""
+    if newer is None or older is None:
+        return None
+    return newer - older
 
 
 @dataclass
 class AnalysisSnapshot:
     """
-    Represents a single analysis snapshot in time.
-    
-    This captures all the key metrics from a Navigator layer or coverage report
-    at a specific point in time, enabling temporal comparison and trend analysis.
-    
-    Attributes:
-        timestamp: When this snapshot was taken
-        file_path: Original file path for reference
-        total_rules: Total number of detection rules
-        unique_techniques: Number of unique MITRE ATT&CK techniques covered
-        unique_tactics: Number of unique MITRE ATT&CK tactics covered
-        technique_coverage: Dictionary mapping techniques to rule counts
-        tactic_coverage: Dictionary mapping tactics to technique counts
-        platform_distribution: Rules per platform (Elastic/Sentinel)
-        parsing_stats: Raw parsing statistics from the analysis
+    A single coverage snapshot.
+
+    ``total_rules`` is None when the source (a Navigator layer) does not say how many
+    rules exist. ``total_techniques_possible`` and ``total_tactics_possible`` are the
+    ATT&CK denominators recorded with the snapshot, or the module fallbacks.
     """
-    
+
     timestamp: datetime
     file_path: str
-    total_rules: int = 0
+    total_rules: Optional[int] = 0
     unique_techniques: int = 0
     unique_tactics: int = 0
     technique_coverage: Dict[str, int] = field(default_factory=dict)
     tactic_coverage: Dict[str, int] = field(default_factory=dict)
     platform_distribution: Dict[str, int] = field(default_factory=dict)
     parsing_stats: Dict[str, Any] = field(default_factory=dict)
-    
-    def get_coverage_percentage(self, total_possible_techniques: int = 800) -> float:
-        """Calculate overall coverage percentage based on total possible techniques."""
-        return (self.unique_techniques / total_possible_techniques) * 100 if total_possible_techniques > 0 else 0
-    
-    def get_tactic_coverage_percentage(self, total_tactics: int = 14) -> float:
-        """Calculate tactic coverage percentage based on standard MITRE tactics."""
-        return (self.unique_tactics / total_tactics) * 100 if total_tactics > 0 else 0
+    total_techniques_possible: int = FALLBACK_TOTAL_TECHNIQUES
+    total_tactics_possible: int = FALLBACK_TOTAL_TACTICS
+    denominator_source: str = "fallback"
+    attack_version: Optional[str] = None
+
+    def get_coverage_percentage(self, total_possible_techniques: Optional[int] = None) -> float:
+        total = total_possible_techniques or self.total_techniques_possible
+        return (self.unique_techniques / total) * 100 if total > 0 else 0
+
+    def get_tactic_coverage_percentage(self, total_tactics: Optional[int] = None) -> float:
+        total = total_tactics or self.total_tactics_possible
+        return (self.unique_tactics / total) * 100 if total > 0 else 0
 
 
 @dataclass
 class ComparisonResult:
-    """
-    Results from comparing two analysis snapshots.
-    
-    This captures the deltas and growth metrics between two points in time,
-    providing the foundation for trend analysis and executive reporting.
-    
-    Attributes:
-        baseline: Earlier snapshot for comparison
-        current: Later snapshot for comparison
-        time_delta_days: Number of days between snapshots
-        rules_added: Net increase in rules
-        techniques_added: Net increase in unique techniques
-        tactics_added: Net increase in unique tactics
-        coverage_growth_percent: Percentage point increase in overall coverage
-        tactic_coverage_growth_percent: Percentage point increase in tactic coverage
-        new_techniques: List of techniques added since baseline
-        new_tactics: List of tactics added since baseline
-        rules_per_day: Average rule development velocity
-    """
-    
+    """Deltas between two snapshots. Rule-based fields are None when rule counts are unknown."""
+
     baseline: AnalysisSnapshot
     current: AnalysisSnapshot
     time_delta_days: float
-    rules_added: int
+    rules_added: Optional[int]
     techniques_added: int
     tactics_added: int
     coverage_growth_percent: float
     tactic_coverage_growth_percent: float
     new_techniques: List[str] = field(default_factory=list)
     new_tactics: List[str] = field(default_factory=list)
-    rules_per_day: float = 0.0
-    
+    rules_per_day: Optional[float] = None
+
     def __post_init__(self):
-        """Calculate derived metrics after object creation."""
-        if self.time_delta_days > 0:
+        if self.time_delta_days > 0 and self.rules_added is not None:
             self.rules_per_day = self.rules_added / self.time_delta_days
 
 
 class TemporalAnalyzer:
-    """
-    Main class for performing temporal analysis on Navigator layers and coverage reports.
-    
-    This class orchestrates the comparison of multiple analysis snapshots, extracts
-    time-series data, and generates executive reports suitable for CISO presentations.
-    
-    The analyzer can work with both Navigator layer JSON files and detailed coverage
-    reports, automatically detecting the format and extracting relevant metrics.
-    """
-    
+    """Loads snapshots from a directory and produces time-series data and a summary."""
+
     def __init__(self):
-        """Initialize the temporal analyzer."""
         self.snapshots: List[AnalysisSnapshot] = []
         self.comparisons: List[ComparisonResult] = []
-        
-    def load_snapshot_from_navigator_layer(self, file_path: str) -> AnalysisSnapshot:
-        """
-        Load analysis snapshot from Navigator layer JSON file.
-        
-        Args:
-            file_path: Path to Navigator layer JSON file
-            
-        Returns:
-            AnalysisSnapshot: Extracted snapshot data
-            
-        Raises:
-            ValueError: If file cannot be parsed or required data is missing
-        """
+        self.skipped_files: List[str] = []
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_json(file_path: Path) -> Any:
+        if file_path.stat().st_size > MAX_SNAPSHOT_FILE_BYTES:
+            raise ValueError(f"JSON file too large: {file_path.stat().st_size} bytes (max 50MB)")
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    @staticmethod
+    def _is_coverage_report_data(data: Any) -> bool:
+        return isinstance(data, dict) and all(
+            key in data for key in ('parsing_statistics', 'coverage_analysis', 'generation_timestamp'))
+
+    @staticmethod
+    def _is_navigator_layer_data(data: Any) -> bool:
+        return (isinstance(data, dict) and isinstance(data.get('techniques'), list)
+                and isinstance(data.get('versions'), dict) and 'domain' in data)
+
+    def _is_coverage_report(self, file_path: Path) -> bool:
+        """True if the file is a coverage report (kept for backward compatibility)."""
         try:
-            # Check file size for security (prevent large file attacks)
-            file_stat = Path(file_path).stat()
-            if file_stat.st_size > 50 * 1024 * 1024:  # 50MB limit for JSON files
-                raise ValueError(f"JSON file too large: {file_stat.st_size} bytes (max 50MB)")
-            
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            # Extract timestamp from filename or layer metadata
-            timestamp = self._extract_timestamp_from_path(file_path)
-            if not timestamp:
-                # Fallback to file modification time
-                timestamp = datetime.fromtimestamp(Path(file_path).stat().st_mtime)
-            
-            # Extract metrics from Navigator layer
-            techniques = data.get('techniques', [])
-            technique_coverage = {}
-            tactic_coverage = defaultdict(set)
-            
-            for technique in techniques:
-                technique_id = technique.get('techniqueID', '')
-                if technique_id:
-                    # Estimate rule count from score (reverse engineering)
-                    score = technique.get('score', 1)
-                    estimated_rules = max(1, score // 20)  # Rough estimation
-                    technique_coverage[technique_id] = estimated_rules
-                    
-                    # Extract tactic information if available in metadata
-                    metadata = technique.get('metadata', [])
-                    for meta in metadata:
-                        if meta.get('name', '').lower() == 'tactics':
-                            tactics = meta.get('value', '').split(',')
-                            for tactic in tactics:
-                                tactic = tactic.strip()
-                                if tactic:
-                                    tactic_coverage[tactic].add(technique_id)
-            
-            # Convert tactic coverage to counts
-            tactic_counts = {tactic: len(techniques) for tactic, techniques in tactic_coverage.items()}
-            
-            # Estimate total rules (this is approximate from Navigator data)
-            estimated_total_rules = sum(technique_coverage.values())
-            
-            snapshot = AnalysisSnapshot(
-                timestamp=timestamp,
-                file_path=file_path,
-                total_rules=estimated_total_rules,
-                unique_techniques=len(technique_coverage),
-                unique_tactics=len(tactic_counts),
-                technique_coverage=technique_coverage,
-                tactic_coverage=tactic_counts,
-                platform_distribution={}  # Not available in Navigator format
-            )
-            
-            logger.info(f"Loaded snapshot from Navigator layer: {file_path}")
-            logger.info(f"  - Timestamp: {timestamp}")
-            logger.info(f"  - Techniques: {snapshot.unique_techniques}")
-            logger.info(f"  - Estimated rules: {estimated_total_rules}")
-            
-            return snapshot
-            
-        except Exception as e:
-            raise ValueError(f"Failed to load Navigator layer from {file_path}: {str(e)}")
-    
+            return self._is_coverage_report_data(self._read_json(file_path))
+        except Exception:
+            return False
+
     def load_snapshot_from_coverage_report(self, file_path: str) -> AnalysisSnapshot:
-        """
-        Load analysis snapshot from detailed coverage report JSON file.
-        
-        Args:
-            file_path: Path to coverage report JSON file
-            
-        Returns:
-            AnalysisSnapshot: Extracted snapshot data
-            
-        Raises:
-            ValueError: If file cannot be parsed or required data is missing
-        """
+        """Load a snapshot from a coverage report. Raises ValueError on invalid input."""
         try:
-            # Check file size for security (prevent large file attacks)
-            file_stat = Path(file_path).stat()
-            if file_stat.st_size > 50 * 1024 * 1024:  # 50MB limit for JSON files
-                raise ValueError(f"JSON file too large: {file_stat.st_size} bytes (max 50MB)")
-            
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            # Extract timestamp
-            timestamp_str = data.get('generation_timestamp')
-            if timestamp_str:
-                timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-            else:
-                timestamp = datetime.fromtimestamp(Path(file_path).stat().st_mtime)
-            
-            # Validate required data is present
-            if not data or 'coverage_analysis' not in data:
-                raise ValueError(f"Invalid coverage report format: missing required data")
-            
-            # Extract coverage analysis data
-            coverage_analysis = data.get('coverage_analysis', {})
-            parsing_stats = data.get('parsing_statistics', {})
-            
-            # Validate coverage analysis has required fields
-            if 'total_rules' not in coverage_analysis or 'unique_techniques' not in coverage_analysis:
-                raise ValueError(f"Invalid coverage report format: missing required coverage data")
-            
-            technique_coverage = coverage_analysis.get('technique_frequency', {})
-            tactic_coverage = coverage_analysis.get('tactic_coverage_counts', {})
-            platform_analysis = coverage_analysis.get('platform_analysis', {})
-            platform_distribution = platform_analysis.get('by_platform', {})
-            
-            snapshot = AnalysisSnapshot(
-                timestamp=timestamp,
-                file_path=file_path,
-                total_rules=coverage_analysis.get('total_rules', 0),
-                unique_techniques=coverage_analysis.get('unique_techniques', 0),
-                unique_tactics=len(tactic_coverage),
-                technique_coverage=technique_coverage,
-                tactic_coverage=tactic_coverage,
-                platform_distribution=platform_distribution,
-                parsing_stats=parsing_stats
-            )
-            
-            logger.info(f"Loaded snapshot from coverage report: {file_path}")
-            logger.info(f"  - Timestamp: {timestamp}")
-            logger.info(f"  - Total rules: {snapshot.total_rules}")
-            logger.info(f"  - Unique techniques: {snapshot.unique_techniques}")
-            logger.info(f"  - Unique tactics: {snapshot.unique_tactics}")
-            
-            return snapshot
-            
+            path = Path(file_path)
+            return self._snapshot_from_report(self._read_json(path), path)
         except Exception as e:
-            raise ValueError(f"Failed to load coverage report from {file_path}: {str(e)}")
-    
-    def load_snapshots_from_directory(self, directory_path: str, 
-                                    file_pattern: str = "*.json") -> int:
+            raise ValueError(f"Failed to load coverage report from {file_path}: {e}")
+
+    def load_snapshot_from_navigator_layer(self, file_path: str) -> AnalysisSnapshot:
+        """Load a snapshot from a Navigator layer. Raises ValueError on invalid input."""
+        try:
+            path = Path(file_path)
+            return self._snapshot_from_layer(self._read_json(path), path)
+        except Exception as e:
+            raise ValueError(f"Failed to load Navigator layer from {file_path}: {e}")
+
+    def _snapshot_from_report(self, data: Dict[str, Any], path: Path) -> AnalysisSnapshot:
+        coverage = data.get('coverage_analysis')
+        if not isinstance(coverage, dict) or 'total_rules' not in coverage or 'unique_techniques' not in coverage:
+            raise ValueError("Invalid coverage report format: missing coverage data")
+
+        timestamp_str = data.get('generation_timestamp')
+        timestamp = None
+        if timestamp_str:
+            try:
+                timestamp = _to_naive_utc(datetime.fromisoformat(str(timestamp_str).replace('Z', '+00:00')))
+            except ValueError:
+                timestamp = None
+        if timestamp is None:
+            timestamp = self._timestamp_for(path)
+
+        parsing_stats = data.get('parsing_statistics', {})
+        technique_coverage = coverage.get('technique_frequency', {})
+        tactic_coverage = coverage.get('tactic_coverage_counts', {})
+
+        # Tactics known from any source: validator-derived counts, rule-declared tactics,
+        # or the parser's unique tactic list (older reports serialized sets as strings,
+        # which are ignored)
+        tactic_names = set(tactic_coverage) | set(coverage.get('rules_per_tactic', {}))
+        listed = parsing_stats.get('attack_analysis', {}).get('unique_tactics')
+        if isinstance(listed, list):
+            tactic_names.update(listed)
+
+        attack_data = data.get('attack_data') or {}
+        technique_total = attack_data.get('active_technique_count')
+        tactic_total = attack_data.get('tactic_count')
+
+        return AnalysisSnapshot(
+            timestamp=timestamp,
+            file_path=str(path),
+            total_rules=coverage.get('total_rules', 0),
+            unique_techniques=coverage.get('unique_techniques', 0),
+            unique_tactics=len(tactic_names),
+            technique_coverage=technique_coverage,
+            tactic_coverage=tactic_coverage,
+            platform_distribution=coverage.get('platform_analysis', {}).get('by_platform', {}),
+            parsing_stats=data,
+            total_techniques_possible=technique_total or FALLBACK_TOTAL_TECHNIQUES,
+            total_tactics_possible=tactic_total or FALLBACK_TOTAL_TACTICS,
+            denominator_source=(f"ATT&CK {attack_data.get('version') or 'data'}" if technique_total else "fallback"),
+            attack_version=attack_data.get('version'),
+        )
+
+    def _snapshot_from_layer(self, data: Dict[str, Any], path: Path) -> AnalysisSnapshot:
+        technique_coverage: Dict[str, int] = {}
+        tactics: Dict[str, set] = defaultdict(set)
+
+        for entry in data.get('techniques', []):
+            technique_id = entry.get('techniqueID')
+            if not technique_id:
+                continue
+            rule_count = 1
+            for meta in entry.get('metadata', []):
+                name = str(meta.get('name', '')).lower()
+                value = str(meta.get('value', ''))
+                if name == 'rule count' and value.isdigit():
+                    rule_count = int(value)
+                elif 'tactic' in name:
+                    for tactic in value.split(','):
+                        if tactic.strip():
+                            tactics[tactic.strip()].add(technique_id)
+            if entry.get('tactic'):
+                tactics[entry['tactic']].add(technique_id)
+            technique_coverage[technique_id] = rule_count
+
+        return AnalysisSnapshot(
+            timestamp=self._timestamp_for(path),
+            file_path=str(path),
+            total_rules=None,  # A layer does not record how many rules exist
+            unique_techniques=len(technique_coverage),
+            unique_tactics=len(tactics),
+            technique_coverage=technique_coverage,
+            tactic_coverage={t: len(v) for t, v in tactics.items()},
+            attack_version=str(data.get('versions', {}).get('attack') or '') or None,
+        )
+
+    def load_snapshots_from_directory(self, directory_path: str, file_pattern: str = "*.json") -> int:
         """
-        Load all snapshots from a directory containing analysis files.
-        
-        Args:
-            directory_path: Directory to scan for analysis files
-            file_pattern: Glob pattern for matching files
-            
-        Returns:
-            int: Number of snapshots successfully loaded
+        Load every coverage report and Navigator layer in a directory.
+
+        Files are classified by content; other JSON files are skipped. Returns the
+        number of snapshots loaded.
         """
         directory = Path(directory_path)
-        if not directory.exists():
+        if not directory.is_dir():
             raise ValueError(f"Directory does not exist: {directory_path}")
-        
-        loaded_count = 0
+
         files = sorted(directory.glob(file_pattern))
-        total_size = 0
-        
-        # Check total size before loading to prevent memory exhaustion
+        total_size = sum(f.stat().st_size for f in files if f.is_file())
+        if total_size > MAX_TOTAL_BYTES:
+            logger.warning(f"Total file size {total_size / (1024 * 1024):.1f}MB exceeds the safe limit")
+
+        loaded_count = 0
         for file_path in files:
-            total_size += file_path.stat().st_size
-            
-        if total_size > 500 * 1024 * 1024:  # 500MB total limit
-            logger.warning(f"Total file size {total_size / (1024*1024):.1f}MB exceeds safe limit")
-        
-        for file_path in files:
+            if not file_path.is_file():
+                continue
             try:
-                # Try to determine file type and load accordingly
-                if self._is_coverage_report(file_path):
-                    snapshot = self.load_snapshot_from_coverage_report(str(file_path))
+                data = self._read_json(file_path)
+                if self._is_coverage_report_data(data):
+                    snapshot = self._snapshot_from_report(data, file_path)
+                elif self._is_navigator_layer_data(data):
+                    snapshot = self._snapshot_from_layer(data, file_path)
                 else:
-                    snapshot = self.load_snapshot_from_navigator_layer(str(file_path))
-                
+                    self.skipped_files.append(str(file_path))
+                    logger.info(f"Skipping {file_path.name}: not a coverage report or Navigator layer")
+                    continue
                 self.snapshots.append(snapshot)
                 loaded_count += 1
-                
+                logger.info(f"Loaded snapshot {file_path.name}: {snapshot.timestamp.isoformat()}, "
+                            f"{snapshot.unique_techniques} techniques, rules={snapshot.total_rules}")
             except Exception as e:
-                logger.warning(f"Failed to load {file_path}: {str(e)}")
-        
-        # Sort snapshots by timestamp
+                self.skipped_files.append(str(file_path))
+                logger.warning(f"Failed to load {file_path}: {e}")
+
         self.snapshots.sort(key=lambda s: s.timestamp)
-        
         logger.info(f"Loaded {loaded_count} snapshots from {directory_path}")
         return loaded_count
-    
+
+    @staticmethod
+    def _timestamp_from_name(name: str) -> Optional[datetime]:
+        """Timestamp from a filename: *_YYYYMMDD_HHMMSS.json, then YYYY-MM-DD."""
+        match = re.search(r'(\d{8}_\d{6})', name)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), '%Y%m%d_%H%M%S')
+            except ValueError:
+                pass
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', name)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), '%Y-%m-%d')
+            except ValueError:
+                pass
+        return None
+
+    def _timestamp_for(self, path: Path) -> datetime:
+        return self._timestamp_from_name(path.name) or datetime.fromtimestamp(path.stat().st_mtime)
+
+    def _extract_timestamp_from_path(self, file_path: str) -> Optional[datetime]:
+        """Kept for backward compatibility: timestamp from a filename, or None."""
+        return self._timestamp_from_name(Path(file_path).name)
+
+    # ------------------------------------------------------------------
+    # Analysis
+    # ------------------------------------------------------------------
+
     def compare_snapshots(self, baseline_idx: int, current_idx: int) -> ComparisonResult:
-        """
-        Compare two snapshots and calculate growth metrics.
-        
-        Args:
-            baseline_idx: Index of baseline snapshot
-            current_idx: Index of current snapshot
-            
-        Returns:
-            ComparisonResult: Detailed comparison results
-            
-        Raises:
-            IndexError: If indices are invalid
-        """
-        if baseline_idx >= len(self.snapshots) or current_idx >= len(self.snapshots):
+        """Compare two snapshots by index. Raises IndexError for invalid indices."""
+        if not (0 <= baseline_idx < len(self.snapshots)) or not (0 <= current_idx < len(self.snapshots)):
             raise IndexError("Invalid snapshot indices")
-        
+
         baseline = self.snapshots[baseline_idx]
         current = self.snapshots[current_idx]
-        
-        # Calculate time delta
-        time_delta = current.timestamp - baseline.timestamp
-        time_delta_days = time_delta.total_seconds() / (24 * 3600)
-        
-        # Calculate growth metrics
-        rules_added = current.total_rules - baseline.total_rules
-        techniques_added = current.unique_techniques - baseline.unique_techniques
-        tactics_added = current.unique_tactics - baseline.unique_tactics
-        
-        # Calculate coverage growth (percentage points)
-        baseline_coverage = baseline.get_coverage_percentage()
-        current_coverage = current.get_coverage_percentage()
-        coverage_growth = current_coverage - baseline_coverage
-        
-        baseline_tactic_coverage = baseline.get_tactic_coverage_percentage()
-        current_tactic_coverage = current.get_tactic_coverage_percentage()
-        tactic_coverage_growth = current_tactic_coverage - baseline_tactic_coverage
-        
-        # Find new techniques and tactics
-        baseline_techniques = set(baseline.technique_coverage.keys())
-        current_techniques = set(current.technique_coverage.keys())
-        new_techniques = list(current_techniques - baseline_techniques)
-        
-        baseline_tactics = set(baseline.tactic_coverage.keys())
-        current_tactics = set(current.tactic_coverage.keys())
-        new_tactics = list(current_tactics - baseline_tactics)
-        
+        time_delta_days = (current.timestamp - baseline.timestamp).total_seconds() / 86400
+
         comparison = ComparisonResult(
             baseline=baseline,
             current=current,
             time_delta_days=time_delta_days,
-            rules_added=rules_added,
-            techniques_added=techniques_added,
-            tactics_added=tactics_added,
-            coverage_growth_percent=coverage_growth,
-            tactic_coverage_growth_percent=tactic_coverage_growth,
-            new_techniques=new_techniques,
-            new_tactics=new_tactics
+            rules_added=_delta(current.total_rules, baseline.total_rules),
+            techniques_added=current.unique_techniques - baseline.unique_techniques,
+            tactics_added=current.unique_tactics - baseline.unique_tactics,
+            coverage_growth_percent=current.get_coverage_percentage() - baseline.get_coverage_percentage(),
+            tactic_coverage_growth_percent=(current.get_tactic_coverage_percentage()
+                                            - baseline.get_tactic_coverage_percentage()),
+            new_techniques=sorted(set(current.technique_coverage) - set(baseline.technique_coverage)),
+            new_tactics=sorted(set(current.tactic_coverage) - set(baseline.tactic_coverage)),
         )
-        
         self.comparisons.append(comparison)
         return comparison
-    
+
     def generate_time_series_data(self) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Generate time-series data suitable for charting and executive reporting.
-        
-        Returns:
-            Dict containing multiple time series for different metrics
-        """
+        """Time series for charting. Unknown values (None) are emitted as null / empty CSV cells."""
         if not self.snapshots:
             return {}
-        
-        # Generate time series for key metrics
-        time_series = {
-            'coverage_trends': [],
-            'rule_growth': [],
-            'technique_growth': [],
-            'tactic_growth': [],
-            'velocity_metrics': [],
-            'platform_distribution': []
+
+        series: Dict[str, List[Dict[str, Any]]] = {
+            'coverage_trends': [], 'rule_growth': [], 'technique_growth': [],
+            'tactic_growth': [], 'velocity_metrics': [], 'platform_distribution': []
         }
-        
-        # Calculate baseline date for relative time calculations
         baseline_date = self.snapshots[0].timestamp
-        
-        for i, snapshot in enumerate(self.snapshots):
-            # Calculate days since baseline
-            days_since_baseline = (snapshot.timestamp - baseline_date).total_seconds() / (24 * 3600)
-            
-            # Coverage trends
-            time_series['coverage_trends'].append({
-                'date': snapshot.timestamp.isoformat(),
-                'days_since_baseline': round(days_since_baseline, 1),
-                'total_coverage_percent': round(snapshot.get_coverage_percentage(), 2),
-                'tactic_coverage_percent': round(snapshot.get_tactic_coverage_percentage(), 2),
-                'unique_techniques': snapshot.unique_techniques,
-                'unique_tactics': snapshot.unique_tactics
+
+        for i, snap in enumerate(self.snapshots):
+            days = round((snap.timestamp - baseline_date).total_seconds() / 86400, 1)
+            date = snap.timestamp.isoformat()
+
+            series['coverage_trends'].append({
+                'date': date, 'days_since_baseline': days,
+                'total_coverage_percent': round(snap.get_coverage_percentage(), 2),
+                'tactic_coverage_percent': round(snap.get_tactic_coverage_percentage(), 2),
+                'unique_techniques': snap.unique_techniques,
+                'unique_tactics': snap.unique_tactics,
+                'coverage_basis': snap.denominator_source,
             })
-            
-            # Rule growth
-            time_series['rule_growth'].append({
-                'date': snapshot.timestamp.isoformat(),
-                'days_since_baseline': round(days_since_baseline, 1),
-                'total_rules': snapshot.total_rules,
-                'rules_with_techniques': snapshot.parsing_stats.get('coverage_analysis', {}).get('rules_with_techniques', 0) if snapshot.parsing_stats else 0
+            series['rule_growth'].append({
+                'date': date, 'days_since_baseline': days, 'total_rules': snap.total_rules,
+                'rules_with_techniques': snap.parsing_stats.get('coverage_analysis', {}).get('rules_with_techniques')
+                if snap.parsing_stats else None,
             })
-            
-            # Technique growth
-            time_series['technique_growth'].append({
-                'date': snapshot.timestamp.isoformat(),
-                'days_since_baseline': round(days_since_baseline, 1),
-                'unique_techniques': snapshot.unique_techniques,
-                'total_technique_mappings': sum(snapshot.technique_coverage.values())
+            series['technique_growth'].append({
+                'date': date, 'days_since_baseline': days,
+                'unique_techniques': snap.unique_techniques,
+                'total_technique_mappings': sum(snap.technique_coverage.values()),
             })
-            
-            # Tactic growth
-            time_series['tactic_growth'].append({
-                'date': snapshot.timestamp.isoformat(),
-                'days_since_baseline': round(days_since_baseline, 1),
-                'unique_tactics': snapshot.unique_tactics,
-                'total_tactic_mappings': sum(snapshot.tactic_coverage.values())
+            series['tactic_growth'].append({
+                'date': date, 'days_since_baseline': days,
+                'unique_tactics': snap.unique_tactics,
+                'total_tactic_mappings': sum(snap.tactic_coverage.values()),
             })
-            
-            # Platform distribution
-            time_series['platform_distribution'].append({
-                'date': snapshot.timestamp.isoformat(),
-                'days_since_baseline': round(days_since_baseline, 1),
-                'elastic_rules': snapshot.platform_distribution.get('elastic_rules', 0),
-                'sentinel_rules': snapshot.platform_distribution.get('sentinel_rules', 0),
-                'total_rules': snapshot.total_rules
+            series['platform_distribution'].append({
+                'date': date, 'days_since_baseline': days,
+                'elastic_rules': snap.platform_distribution.get('elastic_rules'),
+                'sentinel_rules': snap.platform_distribution.get('sentinel_rules'),
+                'total_rules': snap.total_rules,
             })
-            
-            # Velocity metrics (requires comparison with previous snapshot)
+
             if i > 0:
-                prev_snapshot = self.snapshots[i - 1]
-                time_delta = (snapshot.timestamp - prev_snapshot.timestamp).total_seconds() / (24 * 3600)
-                
-                if time_delta > 0:
-                    rules_velocity = (snapshot.total_rules - prev_snapshot.total_rules) / time_delta
-                    techniques_velocity = (snapshot.unique_techniques - prev_snapshot.unique_techniques) / time_delta
-                    
-                    time_series['velocity_metrics'].append({
-                        'date': snapshot.timestamp.isoformat(),
-                        'days_since_baseline': round(days_since_baseline, 1),
-                        'rules_per_day': round(rules_velocity, 2),
-                        'techniques_per_day': round(techniques_velocity, 2),
-                        'period_days': round(time_delta, 1)
+                prev = self.snapshots[i - 1]
+                period = (snap.timestamp - prev.timestamp).total_seconds() / 86400
+                if period > 0:
+                    rules_delta = _delta(snap.total_rules, prev.total_rules)
+                    series['velocity_metrics'].append({
+                        'date': date, 'days_since_baseline': days,
+                        'rules_per_day': round(rules_delta / period, 2) if rules_delta is not None else None,
+                        'techniques_per_day': round((snap.unique_techniques - prev.unique_techniques) / period, 2),
+                        'period_days': round(period, 1),
                     })
-        
-        return time_series
-    
+        return series
+
     def generate_executive_summary(self) -> Dict[str, Any]:
-        """
-        Generate executive summary suitable for CISO reporting.
-        
-        Returns:
-            Dict containing executive-level metrics and insights
-        """
+        """Summary of growth, current status, velocity and trends."""
         if len(self.snapshots) < 2:
             return {'error': 'Need at least 2 snapshots for meaningful analysis'}
-        
-        # Get overall timeframe and latest snapshot
-        first_snapshot = self.snapshots[0]
-        latest_snapshot = self.snapshots[-1]
-        timeframe_days = (latest_snapshot.timestamp - first_snapshot.timestamp).total_seconds() / (24 * 3600)
-        
-        # Calculate overall growth metrics
-        total_rules_growth = latest_snapshot.total_rules - first_snapshot.total_rules
-        total_techniques_growth = latest_snapshot.unique_techniques - first_snapshot.unique_techniques
-        total_tactics_growth = latest_snapshot.unique_tactics - first_snapshot.unique_tactics
-        
-        coverage_start = first_snapshot.get_coverage_percentage()
-        coverage_end = latest_snapshot.get_coverage_percentage()
-        coverage_improvement = coverage_end - coverage_start
-        
-        tactic_coverage_start = first_snapshot.get_tactic_coverage_percentage()
-        tactic_coverage_end = latest_snapshot.get_tactic_coverage_percentage()
-        tactic_coverage_improvement = tactic_coverage_end - tactic_coverage_start
-        
-        # Calculate velocity metrics
-        avg_rules_per_day = total_rules_growth / timeframe_days if timeframe_days > 0 else 0
-        avg_techniques_per_day = total_techniques_growth / timeframe_days if timeframe_days > 0 else 0
-        
-        # Generate trend analysis
-        monthly_snapshots = self._group_snapshots_by_month()
-        quarterly_snapshots = self._group_snapshots_by_quarter()
-        
-        summary = {
+
+        first, latest = self.snapshots[0], self.snapshots[-1]
+        timeframe_days = (latest.timestamp - first.timestamp).total_seconds() / 86400
+
+        rules_growth = _delta(latest.total_rules, first.total_rules)
+        techniques_growth = latest.unique_techniques - first.unique_techniques
+        tactics_growth = latest.unique_tactics - first.unique_tactics
+
+        coverage_improvement = latest.get_coverage_percentage() - first.get_coverage_percentage()
+        tactic_improvement = latest.get_tactic_coverage_percentage() - first.get_tactic_coverage_percentage()
+
+        avg_rules_per_day = (rules_growth / timeframe_days) if (rules_growth is not None and timeframe_days > 0) else None
+        avg_techniques_per_day = techniques_growth / timeframe_days if timeframe_days > 0 else 0
+
+        def monthly(value: Optional[float]) -> Optional[float]:
+            return round(value * 30, 1) if value is not None else None
+
+        return {
             'analysis_period': {
-                'start_date': first_snapshot.timestamp.isoformat(),
-                'end_date': latest_snapshot.timestamp.isoformat(),
+                'start_date': first.timestamp.isoformat(),
+                'end_date': latest.timestamp.isoformat(),
                 'total_days': round(timeframe_days, 1),
-                'total_snapshots': len(self.snapshots)
+                'total_snapshots': len(self.snapshots),
             },
+            'coverage_basis': (f"{latest.denominator_source}: {latest.total_techniques_possible} techniques, "
+                               f"{latest.total_tactics_possible} tactics"),
             'overall_growth': {
-                'rules_added': total_rules_growth,
-                'techniques_added': total_techniques_growth,
-                'tactics_added': total_tactics_growth,
+                'rules_added': rules_growth,
+                'techniques_added': techniques_growth,
+                'tactics_added': tactics_growth,
                 'coverage_improvement_percent': round(coverage_improvement, 2),
-                'tactic_coverage_improvement_percent': round(tactic_coverage_improvement, 2)
+                'tactic_coverage_improvement_percent': round(tactic_improvement, 2),
             },
             'current_status': {
-                'total_rules': latest_snapshot.total_rules,
-                'unique_techniques_covered': latest_snapshot.unique_techniques,
-                'unique_tactics_covered': latest_snapshot.unique_tactics,
-                'overall_coverage_percent': round(coverage_end, 2),
-                'tactic_coverage_percent': round(tactic_coverage_end, 2)
+                'total_rules': latest.total_rules,
+                'unique_techniques_covered': latest.unique_techniques,
+                'unique_tactics_covered': latest.unique_tactics,
+                'overall_coverage_percent': round(latest.get_coverage_percentage(), 2),
+                'tactic_coverage_percent': round(latest.get_tactic_coverage_percentage(), 2),
             },
             'velocity_metrics': {
-                'average_rules_per_day': round(avg_rules_per_day, 2),
+                'average_rules_per_day': round(avg_rules_per_day, 2) if avg_rules_per_day is not None else None,
                 'average_techniques_per_day': round(avg_techniques_per_day, 3),
-                'average_rules_per_month': round(avg_rules_per_day * 30, 1),
-                'average_techniques_per_month': round(avg_techniques_per_day * 30, 2)
+                'average_rules_per_month': monthly(avg_rules_per_day),
+                'average_techniques_per_month': round(avg_techniques_per_day * 30, 2),
             },
             'trend_analysis': {
-                'monthly_breakdown': monthly_snapshots,
-                'quarterly_breakdown': quarterly_snapshots,
-                'acceleration_indicators': self._calculate_acceleration_indicators()
+                'monthly_breakdown': self._group_snapshots(lambda t: t.strftime('%Y-%m'), 'month'),
+                'quarterly_breakdown': self._group_snapshots(
+                    lambda t: f"{t.year}-Q{(t.month - 1) // 3 + 1}", 'quarter'),
+                'acceleration_indicators': self._calculate_acceleration_indicators(),
             },
+            'skipped_files': list(self.skipped_files),
             'recommendations': self._generate_recommendations(
-                coverage_improvement, tactic_coverage_improvement, avg_rules_per_day
-            )
+                coverage_improvement, tactic_improvement, avg_rules_per_day),
         }
-        
-        return summary
-    
-    def export_to_csv(self, output_directory: str) -> List[str]:
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def export_to_csv(self, output_directory: str, suffix: Optional[str] = None) -> List[str]:
         """
-        Export time-series data to CSV files for Excel/charting tools.
-        
+        Export each time series to CSV.
+
         Args:
-            output_directory: Directory to save CSV files
-            
-        Returns:
-            List of created file paths
+            output_directory: Directory for the files (created if missing)
+            suffix: Optional text (e.g. a timestamp) appended to filenames so runs do not
+                overwrite each other
         """
         output_dir = Path(output_directory)
-        output_dir.mkdir(exist_ok=True)
-        
-        time_series = self.generate_time_series_data()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         created_files = []
-        
-        for series_name, data in time_series.items():
-            if not data:  # Skip empty series
+        for series_name, data in self.generate_time_series_data().items():
+            if not data:
                 continue
-                
-            file_path = output_dir / f"temporal_analysis_{series_name}.csv"
-            
+            name = f"temporal_analysis_{series_name}" + (f"_{suffix}" if suffix else "") + ".csv"
+            file_path = output_dir / name
             with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
-                if data:
-                    fieldnames = data[0].keys()
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(data)
-            
+                writer = csv.DictWriter(csvfile, fieldnames=list(data[0].keys()))
+                writer.writeheader()
+                writer.writerows(data)
             created_files.append(str(file_path))
             logger.info(f"Exported {series_name} to {file_path}")
-        
         return created_files
-    
-    def _extract_timestamp_from_path(self, file_path: str) -> Optional[datetime]:
-        """Extract timestamp from filename if it follows the standard naming convention."""
-        from validators.security_validator import SecurityValidator
-        
-        # Validate file path for security
-        is_valid, error_msg = SecurityValidator.validate_file_path(file_path, {'.json'})
-        if not is_valid:
-            logger.warning(f"Invalid file path in timestamp extraction: {error_msg}")
-            return None
-        
-        filename = Path(file_path).name
-        
-        # Try to match our standard format: *_YYYYMMDD_HHMMSS.json
-        timestamp_pattern = r'(\d{8}_\d{6})'
-        match = re.search(timestamp_pattern, filename)
-        
-        if match:
-            timestamp_str = match.group(1)
-            try:
-                return datetime.strptime(timestamp_str, '%Y%m%d_%H%M%S')
-            except ValueError:
-                pass
-        
-        # Try alternative formats
-        # ISO date format: YYYY-MM-DD
-        iso_pattern = r'(\d{4}-\d{2}-\d{2})'
-        match = re.search(iso_pattern, filename)
-        
-        if match:
-            date_str = match.group(1)
-            try:
-                return datetime.strptime(date_str, '%Y-%m-%d')
-            except ValueError:
-                pass
-        
-        return None
-    
-    def _is_coverage_report(self, file_path: Path) -> bool:
-        """Determine if a file is a coverage report based on content."""
-        try:
-            # Check file size for security (prevent large file attacks)
-            file_stat = file_path.stat()
-            if file_stat.st_size > 50 * 1024 * 1024:  # 50MB limit for JSON files
-                logger.warning(f"File too large for format detection: {file_path}")
-                return False
-            
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                
-            # Coverage reports have these keys at the top level
-            required_keys = ['parsing_statistics', 'coverage_analysis', 'generation_timestamp']
-            return all(key in data for key in required_keys)
-        except Exception:
-            return False
-    
+
+    # ------------------------------------------------------------------
+    # Grouping and trends
+    # ------------------------------------------------------------------
+
+    def _group_snapshots(self, key_func, label: str) -> List[Dict[str, Any]]:
+        groups: Dict[str, List[AnalysisSnapshot]] = defaultdict(list)
+        for snap in self.snapshots:
+            groups[key_func(snap.timestamp)].append(snap)
+
+        summary = []
+        for key, snaps in sorted(groups.items()):
+            latest = max(snaps, key=lambda s: s.timestamp)
+            summary.append({
+                label: key,
+                'total_rules': latest.total_rules,
+                'unique_techniques': latest.unique_techniques,
+                'unique_tactics': latest.unique_tactics,
+                'coverage_percent': round(latest.get_coverage_percentage(), 2),
+                'tactic_coverage_percent': round(latest.get_tactic_coverage_percentage(), 2),
+                'snapshot_count': len(snaps),
+            })
+        return summary
+
     def _group_snapshots_by_month(self) -> List[Dict[str, Any]]:
-        """Group snapshots by month for trend analysis."""
-        monthly_data = defaultdict(list)
-        
-        for snapshot in self.snapshots:
-            month_key = snapshot.timestamp.strftime('%Y-%m')
-            monthly_data[month_key].append(snapshot)
-        
-        monthly_summary = []
-        for month, snapshots in sorted(monthly_data.items()):
-            # Use the latest snapshot in each month
-            latest_in_month = max(snapshots, key=lambda s: s.timestamp)
-            
-            monthly_summary.append({
-                'month': month,
-                'total_rules': latest_in_month.total_rules,
-                'unique_techniques': latest_in_month.unique_techniques,
-                'unique_tactics': latest_in_month.unique_tactics,
-                'coverage_percent': round(latest_in_month.get_coverage_percentage(), 2),
-                'tactic_coverage_percent': round(latest_in_month.get_tactic_coverage_percentage(), 2),
-                'snapshot_count': len(snapshots)
-            })
-        
-        return monthly_summary
-    
+        return self._group_snapshots(lambda t: t.strftime('%Y-%m'), 'month')
+
     def _group_snapshots_by_quarter(self) -> List[Dict[str, Any]]:
-        """Group snapshots by quarter for high-level trend analysis."""
-        quarterly_data = defaultdict(list)
-        
-        for snapshot in self.snapshots:
-            quarter = (snapshot.timestamp.month - 1) // 3 + 1
-            quarter_key = f"{snapshot.timestamp.year}-Q{quarter}"
-            quarterly_data[quarter_key].append(snapshot)
-        
-        quarterly_summary = []
-        for quarter, snapshots in sorted(quarterly_data.items()):
-            latest_in_quarter = max(snapshots, key=lambda s: s.timestamp)
-            
-            quarterly_summary.append({
-                'quarter': quarter,
-                'total_rules': latest_in_quarter.total_rules,
-                'unique_techniques': latest_in_quarter.unique_techniques,
-                'unique_tactics': latest_in_quarter.unique_tactics,
-                'coverage_percent': round(latest_in_quarter.get_coverage_percentage(), 2),
-                'tactic_coverage_percent': round(latest_in_quarter.get_tactic_coverage_percentage(), 2),
-                'snapshot_count': len(snapshots)
-            })
-        
-        return quarterly_summary
-    
+        return self._group_snapshots(lambda t: f"{t.year}-Q{(t.month - 1) // 3 + 1}", 'quarter')
+
     def _calculate_acceleration_indicators(self) -> Dict[str, Any]:
-        """Calculate whether development is accelerating or decelerating."""
+        """Compare first-half and second-half velocity (None-safe for unknown rule counts)."""
         if len(self.snapshots) < 3:
             return {'note': 'Need at least 3 snapshots for acceleration analysis'}
-        
-        # Compare first half vs second half velocity
+
         midpoint = len(self.snapshots) // 2
         first_half = self.snapshots[:midpoint + 1]
         second_half = self.snapshots[midpoint:]
-        
-        # Calculate velocity for each half
-        first_period_days = (first_half[-1].timestamp - first_half[0].timestamp).total_seconds() / (24 * 3600)
-        second_period_days = (second_half[-1].timestamp - second_half[0].timestamp).total_seconds() / (24 * 3600)
-        
-        first_rules_velocity = (first_half[-1].total_rules - first_half[0].total_rules) / first_period_days if first_period_days > 0 else 0
-        second_rules_velocity = (second_half[-1].total_rules - second_half[0].total_rules) / second_period_days if second_period_days > 0 else 0
-        
-        first_techniques_velocity = (first_half[-1].unique_techniques - first_half[0].unique_techniques) / first_period_days if first_period_days > 0 else 0
-        second_techniques_velocity = (second_half[-1].unique_techniques - second_half[0].unique_techniques) / second_period_days if second_period_days > 0 else 0
-        
+
+        def velocity(half: List[AnalysisSnapshot], attr: str) -> Optional[float]:
+            days = (half[-1].timestamp - half[0].timestamp).total_seconds() / 86400
+            change = _delta(getattr(half[-1], attr), getattr(half[0], attr))
+            return change / days if (change is not None and days > 0) else None
+
+        def trend(first: Optional[float], second: Optional[float]) -> str:
+            if first is None or second is None:
+                return 'unknown'
+            return 'accelerating' if second > first else 'decelerating' if second < first else 'stable'
+
+        r1, r2 = velocity(first_half, 'total_rules'), velocity(second_half, 'total_rules')
+        t1, t2 = velocity(first_half, 'unique_techniques'), velocity(second_half, 'unique_techniques')
+
+        def rounded(value: Optional[float], digits: int) -> Optional[float]:
+            return round(value, digits) if value is not None else None
+
         return {
-            'rules_acceleration': 'accelerating' if second_rules_velocity > first_rules_velocity else 'decelerating' if second_rules_velocity < first_rules_velocity else 'stable',
-            'techniques_acceleration': 'accelerating' if second_techniques_velocity > first_techniques_velocity else 'decelerating' if second_techniques_velocity < first_techniques_velocity else 'stable',
-            'first_half_rules_per_day': round(first_rules_velocity, 2),
-            'second_half_rules_per_day': round(second_rules_velocity, 2),
-            'first_half_techniques_per_day': round(first_techniques_velocity, 3),
-            'second_half_techniques_per_day': round(second_techniques_velocity, 3)
+            'rules_acceleration': trend(r1, r2),
+            'techniques_acceleration': trend(t1, t2),
+            'first_half_rules_per_day': rounded(r1, 2),
+            'second_half_rules_per_day': rounded(r2, 2),
+            'first_half_techniques_per_day': rounded(t1, 3),
+            'second_half_techniques_per_day': rounded(t2, 3),
         }
-    
-    def _generate_recommendations(self, coverage_improvement: float, 
-                                tactic_coverage_improvement: float, 
-                                rules_per_day: float) -> List[str]:
-        """Generate actionable recommendations based on analysis."""
+
+    def _generate_recommendations(self, coverage_improvement: float,
+                                  tactic_coverage_improvement: float,
+                                  rules_per_day: Optional[float]) -> List[str]:
         recommendations = []
-        
-        # Coverage-based recommendations
+
         if coverage_improvement < 1.0:
             recommendations.append("Consider accelerating detection rule development to improve overall coverage")
         elif coverage_improvement > 5.0:
-            recommendations.append("Excellent coverage growth - maintain current development velocity")
-        
-        # Tactic-based recommendations
+            recommendations.append("Strong coverage growth - maintain the current development velocity")
+
         if tactic_coverage_improvement < 0.5:
             recommendations.append("Focus on diversifying coverage across different MITRE ATT&CK tactics")
-        
-        # Velocity-based recommendations
-        if rules_per_day < 0.1:
+
+        if rules_per_day is None:
+            recommendations.append("Rule counts are unavailable for these snapshots; use coverage reports "
+                                   "(--report) rather than Navigator layers to track rule growth")
+        elif rules_per_day < 0.1:
             recommendations.append("Consider increasing detection engineering resources for faster rule development")
         elif rules_per_day > 2.0:
-            recommendations.append("High rule development velocity - ensure quality assurance processes keep pace")
-        
-        # General recommendations
+            recommendations.append("High rule development velocity - ensure quality assurance keeps pace")
+
         recommendations.extend([
             "Continue regular snapshot collection for ongoing trend analysis",
             "Consider setting quarterly coverage improvement targets",
-            "Monitor for gaps in specific tactics that may need focused development"
+            "Monitor for gaps in specific tactics that may need focused development",
         ])
-        
         return recommendations

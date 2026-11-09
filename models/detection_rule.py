@@ -13,12 +13,16 @@ The dataclass decorator automatically generates __init__, __repr__, and other me
 reducing boilerplate code while maintaining clean, readable class definitions.
 """
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Set, List, Optional
+from typing import Dict, Set, List, Optional
 
 from config import VALID_TACTICS
+from utils.attack_names import normalize_tactic_name
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -61,151 +65,92 @@ class DetectionRule:
     # MITRE ATT&CK mappings - the core data we're analyzing
     techniques: Set[str] = field(default_factory=set)
     tactics: Set[str] = field(default_factory=set)
+
+    # Tactic/technique pairing, when the source rule provides it (Elastic does; Sentinel
+    # lists tactics and techniques separately). Maps technique ID -> tactics it was
+    # declared under. Techniques without pairing information are simply absent here.
+    technique_tactics: Dict[str, Set[str]] = field(default_factory=dict)
     
     # Metadata that helps with analysis and reporting
     severity: str = "medium"
+    risk_score: Optional[int] = None  # Numeric score from the source (Elastic 0-100), if any
     enabled: bool = True
     rule_id: str = ""
+    source_version: str = ""  # The rule's own version field, exactly as written in the source
     author: str = ""
     created_date: Optional[datetime] = None
     modified_date: Optional[datetime] = None
     false_positives: List[str] = field(default_factory=list)
     references: List[str] = field(default_factory=list)
     
+    # Techniques that were revoked in ATT&CK and replaced: {old_id: new_id}
+    remapped_techniques: Dict[str, str] = field(default_factory=dict)
+
+    # Informational notes about how data was derived (not errors)
+    notes: List[str] = field(default_factory=list)
+
     # Error tracking for debugging and quality assurance
     parse_errors: List[str] = field(default_factory=list)
     
-    def add_technique(self, technique_id: str, context: str = "") -> bool:
+    def add_technique(self, technique_id: str, context: str = "",
+                      tactic: Optional[str] = None) -> bool:
         """
         Add a validated MITRE ATT&CK technique ID to this rule.
-        
-        This method doesn't just blindly add technique IDs - it validates them first
-        to ensure they follow the correct format. This prevents invalid data from
-        polluting our analysis results.
-        
-        The validation follows the official MITRE ATT&CK naming convention:
-        - Main techniques: T#### (e.g., T1055)
-        - Sub-techniques: T####.### (e.g., T1055.001)
-        
+
+        The ID is checked against the official format (T#### or T####.###) and
+        normalized to upper case before being stored.
+
         Args:
-            technique_id: The technique ID to add (will be normalized to uppercase)
-            context: Optional context about where this technique was found (for debugging)
-            
+            technique_id: The technique ID to add
+            context: Optional description of where the ID was found (debug logging only)
+            tactic: Optional tactic the source rule declared this technique under. It is
+                normalized and recorded in ``technique_tactics``.
+
         Returns:
-            bool: True if technique was successfully added, False if invalid
-            
-        Example:
-            rule.add_technique("t1055.001", "found in threat.technique.subtechnique.id")
-            # This normalizes to "T1055.001" and returns True
+            bool: True if the technique was added, False if its format is invalid
         """
         if self._validate_technique_id(technique_id):
-            # Normalize to uppercase for consistency
             normalized_id = technique_id.upper().strip()
             self.techniques.add(normalized_id)
-            
-            # Log successful addition for debugging (if context provided)
+
+            if tactic:
+                normalized_tactic = normalize_tactic_name(tactic)
+                if normalized_tactic in VALID_TACTICS:
+                    self.technique_tactics.setdefault(normalized_id, set()).add(normalized_tactic)
+
             if context:
-                import logging
-                logger = logging.getLogger(__name__)
                 logger.debug(f"Added technique {normalized_id} from {context}")
-            
+
             return True
-        else:
-            # Track invalid technique IDs for quality assurance
-            error_msg = f"Invalid technique ID format: {technique_id}"
-            self.parse_errors.append(error_msg)
-            
-            # Also log the error for immediate visibility during development
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(f"{error_msg} in {self.source_file}")
-            
-            return False
-    
+
+        error_msg = f"Invalid technique ID format: {technique_id}"
+        self.parse_errors.append(error_msg)
+        logger.warning(f"{error_msg} in {self.source_file}")
+        return False
+
     def add_tactic(self, tactic: str) -> bool:
         """
         Add a normalized MITRE ATT&CK tactic to this rule.
-        
-        Tactics represent the high-level goals of an adversary (like "Initial Access"
-        or "Defense Evasion"). Different platforms may format these differently,
-        so we normalize them to match MITRE's standard format.
-        
-        Args:
-            tactic: The tactic name to add (will be normalized)
-            
+
+        Tactic names appear in many spellings ("Initial Access", "InitialAccess",
+        "initial_access"); all are normalized to the ATT&CK short name
+        ("initial-access") and validated against the known tactics.
+
         Returns:
-            bool: True if tactic was successfully added, False if invalid
-            
-        Example:
-            rule.add_tactic("Initial Access")  # becomes "initial-access"
-            rule.add_tactic("Defense_Evasion") # becomes "defense-evasion"
+            bool: True if the tactic was recognized and added, False otherwise
         """
         if not tactic or not isinstance(tactic, str):
             return False
-        
-        # Normalize tactic name to match MITRE conventions
-        # Convert to lowercase, replace spaces and underscores with hyphens
-        normalized_tactic = tactic.lower().strip().replace(' ', '-').replace('_', '-')
-        
-        # Validate against known tactics to prevent typos and invalid entries
+
+        normalized_tactic = normalize_tactic_name(tactic)
+
         if normalized_tactic in VALID_TACTICS:
             self.tactics.add(normalized_tactic)
             return True
-        else:
-            # Log unrecognized tactics for review - they might be valid but new
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(f"Unrecognized tactic '{tactic}' (normalized to '{normalized_tactic}') in {self.source_file}")
-            return False
-    
-    def get_parent_techniques(self) -> Set[str]:
-        """
-        Extract parent technique IDs from any sub-techniques in this rule.
-        
-        Sub-techniques in MITRE ATT&CK follow the format T####.### where the parent
-        technique is T####. This method extracts all parent techniques, which is
-        useful for ensuring proper visualization in Navigator layers.
-        
-        Returns:
-            Set[str]: Set of parent technique IDs
-            
-        Example:
-            If rule has techniques {'T1055.001', 'T1055.002', 'T1078'}
-            This returns {'T1055'} because T1055.001 and T1055.002 are sub-techniques
-            of T1055, while T1078 has no sub-techniques in this rule.
-        """
-        parents = set()
-        for technique in self.techniques:
-            if '.' in technique:  # This is a sub-technique
-                parent = technique.split('.')[0]
-                parents.add(parent)
-        return parents
-    
-    def get_coverage_score(self) -> int:
-        """
-        Calculate a simple coverage score based on the number of techniques.
-        
-        This provides a quick way to assess how comprehensive a rule is in terms
-        of MITRE ATT&CK coverage. Rules covering more techniques might indicate
-        broader detection capabilities.
-        
-        Returns:
-            int: Number of unique techniques covered by this rule
-        """
-        return len(self.techniques)
-    
-    def has_sub_techniques(self) -> bool:
-        """
-        Check if this rule covers any sub-techniques.
-        
-        Sub-techniques provide more granular coverage information and may indicate
-        more sophisticated detection logic.
-        
-        Returns:
-            bool: True if rule has any sub-techniques (format T####.###)
-        """
-        return any('.' in technique for technique in self.techniques)
-    
+
+        logger.warning(f"Unrecognized tactic '{tactic}' (normalized to '{normalized_tactic}') in {self.source_file}")
+        return False
+
     def get_rule_summary(self) -> str:
         """
         Generate a concise summary of this rule for reporting purposes.

@@ -17,11 +17,11 @@ protection rather than relying on a single security measure.
 import os
 import logging
 from pathlib import Path
-from typing import Set, Tuple
+from typing import Optional, Set, Tuple
 
 from config import (
-    MAX_FILE_SIZE, 
-    FORBIDDEN_PATH_PATTERNS,
+    MAX_FILE_SIZE,
+    FORBIDDEN_PATH_PREFIXES,
     SUPPORTED_EXTENSIONS
 )
 
@@ -48,7 +48,38 @@ class SecurityValidator:
     """
     
     @staticmethod
-    def validate_file_path(file_path: str, allowed_extensions: Set[str] = None) -> Tuple[bool, str]:
+    def _forbidden_prefix(path_obj: Path) -> Optional[str]:
+        """
+        Return the forbidden system prefix that contains this RESOLVED path, or None.
+
+        Matching is component-wise on the full path: '/etc' blocks '/etc/passwd' but not
+        '/home/me/etc/rules' or '/etcetera'. Windows prefixes compare case-insensitively.
+        """
+        path_str = str(path_obj).replace('\\', '/')
+        lowered = path_str.lower()
+        for prefix in FORBIDDEN_PATH_PREFIXES:
+            if prefix[1:2] == ':':  # Windows drive-letter prefix
+                candidate, target = prefix.lower(), lowered
+            else:
+                candidate, target = prefix, path_str
+            if target == candidate or target.startswith(candidate.rstrip('/') + '/'):
+                return prefix
+        return None
+
+    @staticmethod
+    def sanitize_output_path(output_path: str) -> str:
+        """
+        Sanitize only the final filename component of a path, leaving directories intact.
+
+        (Sanitizing the whole string would replace the path separators and turn
+        'reports/out.json' into 'reports_out.json'.)
+        """
+        path_obj = Path(output_path)
+        return str(path_obj.parent / SecurityValidator.sanitize_filename(path_obj.name))
+
+    @staticmethod
+    def validate_file_path(file_path: str, allowed_extensions: Set[str] = None,
+                           allowed_root: Optional[str] = None) -> Tuple[bool, str]:
         """
         Comprehensive validation of a file path for security and accessibility.
         
@@ -66,6 +97,8 @@ class SecurityValidator:
         Args:
             file_path: File path to validate (can be relative or absolute)
             allowed_extensions: Set of allowed file extensions (defaults to config)
+            allowed_root: If given, the fully resolved file path must lie inside this
+                directory. This rejects symlinks that point outside the scanned tree.
             
         Returns:
             Tuple[bool, str]: (is_valid, error_message)
@@ -115,10 +148,15 @@ class SecurityValidator:
             
             # Step 5: System file protection
             # This prevents access to sensitive system files and directories
-            path_str = str(path_obj).replace('\\', '/')  # Normalize path separators
-            for forbidden_pattern in FORBIDDEN_PATH_PATTERNS:
-                if forbidden_pattern in path_str:
-                    return False, f"Access to system files not allowed: {forbidden_pattern} detected"
+            forbidden = SecurityValidator._forbidden_prefix(path_obj)
+            if forbidden:
+                return False, f"Access to system files not allowed: {forbidden}"
+
+            if allowed_root is not None:
+                try:
+                    path_obj.relative_to(Path(allowed_root).resolve())
+                except ValueError:
+                    return False, f"File resolves outside the scanned directory (symlink?): {path_obj}"
             
             # Step 6: Permission checks
             # Verify the application can actually read the file
@@ -161,8 +199,10 @@ class SecurityValidator:
         4. Symbolic link detection (prevents symlink attacks)
         """
         try:
-            # Resolve the directory path to its absolute form
-            path_obj = Path(dir_path).resolve()
+            # Detect symlinks BEFORE resolving; resolve() follows them and hides the fact
+            raw_path = Path(dir_path)
+            is_symlink = raw_path.is_symlink()
+            path_obj = raw_path.resolve()
             
             # Basic existence and type validation
             if not path_obj.exists():
@@ -175,16 +215,14 @@ class SecurityValidator:
             if not os.access(path_obj, os.R_OK):
                 return False, f"Directory is not readable: {dir_path}"
             
-            # System directory protection
-            path_str = str(path_obj).replace('\\', '/')
-            for forbidden_pattern in FORBIDDEN_PATH_PATTERNS:
-                if forbidden_pattern in path_str:
-                    return False, f"Access to system directory not allowed: {forbidden_pattern}"
+            # System directory protection (checked on the resolved target)
+            forbidden = SecurityValidator._forbidden_prefix(path_obj)
+            if forbidden:
+                return False, f"Access to system directory not allowed: {forbidden}"
             
-            # Check for symbolic links that might be used for traversal attacks
-            if path_obj.is_symlink():
-                logger.warning(f"Directory is a symbolic link: {dir_path}")
-                # We allow symlinks but log them for security awareness
+            if is_symlink:
+                logger.warning(f"Directory is a symbolic link: {dir_path} -> {path_obj}")
+                # Allowed (the target has passed the checks above) but logged for awareness
             
             logger.debug(f"Directory validation passed: {path_obj}")
             return True, ""
@@ -257,121 +295,53 @@ class SecurityValidator:
         return sanitized
     
     @staticmethod
-    def validate_output_path(output_path: str) -> Tuple[bool, str]:
+    def validate_output_path(output_path: str, create_parents: bool = False) -> Tuple[bool, str]:
         """
         Validate output file path for safe writing operations.
-        
-        This method ensures an output path is safe for writing operations,
-        preventing overwriting of critical system files or writing to
-        protected directories.
-        
+
         Args:
             output_path: Proposed output file path
-            
+            create_parents: Create missing parent directories (after the location has
+                passed the system-path check)
+
         Returns:
             Tuple[bool, str]: (is_valid, error_message)
         """
         try:
             path_obj = Path(output_path).resolve()
-            
-            # Check if parent directory exists and is writable
             parent_dir = path_obj.parent
+
+            # Prevent writing to critical system locations (checked before any mkdir)
+            forbidden = SecurityValidator._forbidden_prefix(path_obj)
+            if forbidden:
+                return False, f"Cannot write to system location: {forbidden}"
+
             if not parent_dir.exists():
-                return False, f"Output directory does not exist: {parent_dir}"
-            
+                if not create_parents:
+                    return False, f"Output directory does not exist: {parent_dir}"
+                try:
+                    parent_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    return False, f"Could not create output directory {parent_dir}: {e}"
+
             if not parent_dir.is_dir():
                 return False, f"Output parent path is not a directory: {parent_dir}"
-            
+
             if not os.access(parent_dir, os.W_OK):
                 return False, f"Output directory is not writable: {parent_dir}"
-            
-            # Prevent overwriting critical system files
-            path_str = str(path_obj).replace('\\', '/')
-            for forbidden_pattern in FORBIDDEN_PATH_PATTERNS:
-                if forbidden_pattern in path_str:
-                    return False, f"Cannot write to system location: {forbidden_pattern}"
-            
+
             # If file exists, check if it's writable
             if path_obj.exists():
                 if not os.access(path_obj, os.W_OK):
                     return False, f"Existing output file is not writable: {output_path}"
                 logger.info(f"Output file already exists and will be overwritten: {output_path}")
-            
+
             return True, ""
-            
+
         except Exception as e:
             logger.error(f"Output path validation error: {str(e)}")
             return False, f"Output path validation error: {str(e)}"
-    
-    @staticmethod
-    def validate_input_string(input_str: str, max_length: int = 1000, 
-                             allowed_chars: str = None) -> Tuple[bool, str]:
-        """
-        Validate input strings to prevent injection attacks and ensure data quality.
-        
-        This method validates text inputs like rule names, descriptions, and other
-        string data to ensure they don't contain potentially dangerous content.
-        
-        Args:
-            input_str: String to validate
-            max_length: Maximum allowed string length
-            allowed_chars: Regex pattern for allowed characters (optional)
-            
-        Returns:
-            Tuple[bool, str]: (is_valid, error_message)
-        """
-        if not isinstance(input_str, str):
-            return False, "Input must be a string"
-        
-        # Length validation
-        if len(input_str) > max_length:
-            return False, f"Input too long: {len(input_str)} characters (limit: {max_length})"
-        
-        # Check for control characters that might indicate injection attempts
-        control_chars = [chr(i) for i in range(32) if i not in [9, 10, 13]]  # Allow tab, LF, CR
-        for char in control_chars:
-            if char in input_str:
-                return False, f"Control character detected: {repr(char)}"
-        
-        # Optional character set validation
-        if allowed_chars:
-            import re
-            if not re.match(f'^[{allowed_chars}]*$', input_str):
-                return False, f"Invalid characters detected. Allowed pattern: {allowed_chars}"
-        
-        return True, ""
-    
-    @staticmethod
-    def is_safe_for_logging(text: str, max_length: int = 500) -> str:
-        """
-        Sanitize text for safe inclusion in log messages.
-        
-        Log injection attacks can occur when user-controlled data is written to
-        logs without proper sanitization. This method ensures log messages are safe.
-        
-        Args:
-            text: Text to include in logs
-            max_length: Maximum length to prevent log bloat
-            
-        Returns:
-            str: Sanitized text safe for logging
-        """
-        if not text or not isinstance(text, str):
-            return "[invalid input]"
-        
-        # Remove potentially dangerous characters
-        # Newlines and carriage returns can be used for log injection
-        sanitized = text.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-        
-        # Remove other control characters
-        sanitized = ''.join(char for char in sanitized if ord(char) >= 32 or char in '\t')
-        
-        # Limit length to prevent log spam
-        if len(sanitized) > max_length:
-            sanitized = sanitized[:max_length] + "[truncated]"
-        
-        return sanitized
-    
+
     @classmethod
     def perform_startup_security_check(cls) -> bool:
         """
@@ -397,10 +367,10 @@ class SecurityValidator:
             checks_passed += 1
         
         # Check 2: Verify forbidden patterns are configured
-        if not FORBIDDEN_PATH_PATTERNS:
-            logger.warning("No forbidden path patterns configured - security risk!")
+        if not FORBIDDEN_PATH_PREFIXES:
+            logger.warning("No forbidden path prefixes configured - security risk!")
         else:
-            logger.debug(f"Forbidden path patterns configured: {len(FORBIDDEN_PATH_PATTERNS)} patterns")
+            logger.debug(f"Forbidden path prefixes configured: {len(FORBIDDEN_PATH_PREFIXES)}")
             checks_passed += 1
         
         # Check 3: Verify supported extensions are reasonable

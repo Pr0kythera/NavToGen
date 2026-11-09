@@ -1,0 +1,13 @@
+# Tool configuration only. NavToGen is run as `python main.py`; installable packaging is tracked in TODO.md (F12).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+# Errors and pyflakes. Style rules are not enforced yet (the code base has long docstring lines).
+select = ["E9", "F"]

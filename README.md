@@ -1,10 +1,10 @@
-# Enterprise MITRE ATT&CK Coverage Analyzer
+# NavToGen - MITRE ATT&CK Coverage Analyzer
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![MITRE ATT&CK](https://img.shields.io/badge/MITRE-ATT%26CK-red.svg)](https://attack.mitre.org/)
 
-A comprehensive, enterprise-grade tool for analyzing MITRE ATT&CK coverage across detection rule repositories. This analyzer transforms your detection rules from Elastic Security and Microsoft Sentinel into actionable coverage visualizations, helping security teams identify gaps and optimize their detection strategies.
+A tool for analyzing MITRE ATT&CK coverage across detection rule repositories. This analyzer transforms your detection rules from Elastic Security and Microsoft Sentinel into actionable coverage visualizations, helping security teams identify gaps and optimize their detection strategies.
 
 ## Table of Contents
 
@@ -14,6 +14,7 @@ A comprehensive, enterprise-grade tool for analyzing MITRE ATT&CK coverage acros
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Comprehensive Usage Guide](#comprehensive-usage-guide)
+- [Supported Rule Formats](#supported-rule-formats)
 - [Analysis Modes](#analysis-modes)
 - [Advanced Features](#advanced-features)
 - [Architecture Overview](#architecture-overview)
@@ -25,7 +26,7 @@ A comprehensive, enterprise-grade tool for analyzing MITRE ATT&CK coverage acros
 
 ## Overview
 
-The Enterprise MITRE ATT&CK Coverage Analyzer bridges the gap between your detection rule repositories and strategic security insights. Instead of manually tracking which MITRE ATT&CK techniques your detection rules cover, this tool automatically parses your rule sets, extracts technique mappings, validates them against the official ATT&CK framework, and generates professional visualizations using the MITRE ATT&CK Navigator.
+NavToGen bridges the gap between your detection rule repositories and strategic security insights. Instead of manually tracking which MITRE ATT&CK techniques your detection rules cover, this tool automatically parses your rule sets, extracts technique mappings, validates them against the official ATT&CK framework, and generates professional visualizations using the MITRE ATT&CK Navigator.
 
 Think of this tool as your "detection coverage translator" - it takes the technical details buried in hundreds of detection rules and transforms them into clear, actionable intelligence that security leaders can use to make informed decisions about their defensive posture.
 
@@ -68,58 +69,29 @@ Rule developers need to understand the broader context of their work and avoid d
 
 ### Prerequisites
 
-Before installing the Enterprise MITRE ATT&CK Coverage Analyzer, ensure your system meets these requirements:
+- **Python 3.11 or newer** (TOML rule support uses the standard library `tomllib`)
+- **Network access (optional)**: only needed to download ATT&CK data for validation. The data is cached on disk, and a local file can be used instead (`--attack-data-file`) for offline or air-gapped use.
 
-- **Python 3.8 or higher**: The tool uses modern Python features and requires a recent Python version for optimal performance and security
-- **Network access (optional)**: For MITRE ATT&CK framework validation, the tool needs to download data from the official MITRE repository
-- **Adequate disk space**: Plan for approximately 100MB of temporary space during analysis of large rule repositories
-
-### Standard Installation
-
-The most straightforward installation method uses pip to install the required dependencies:
+### Standard installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-organization/enterprise-mitre-analyzer.git
-cd enterprise-mitre-analyzer
-
-# Install required dependencies
+git clone https://github.com/Pr0kythera/NavToGen.git
+cd NavToGen
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
-
-# Verify installation
 python main.py --version
 ```
 
-### Virtual Environment Installation (Recommended)
-
-For better dependency management and to avoid conflicts with other Python projects, we recommend using a virtual environment:
+### Development installation
 
 ```bash
-# Create and activate virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Test the installation
-python main.py --help
+pip install -r requirements-dev.txt
+python -m pytest        # run the test suite
+ruff check .            # lint
 ```
 
-### Development Installation
-
-If you plan to contribute to the project or need additional development tools:
-
-```bash
-# Install with development dependencies
-pip install -r requirements.txt
-
-# Install additional development tools
-pip install pytest pytest-cov black flake8 mypy
-
-# Run tests to verify everything works
-python -m pytest
-```
+CI runs the same two commands on Python 3.11, 3.12 and 3.13.
 
 ## Quick Start
 
@@ -177,20 +149,31 @@ python main.py \
 
 The resulting visualization uses a color-coded system to show platform-specific coverage. Green indicates techniques covered by both platforms, providing redundancy and confidence in your detection capabilities. Blue shows techniques detected only by Elastic, while orange indicates Sentinel-only coverage. This analysis helps optimize platform deployments and identify single points of failure in your detection architecture.
 
-### Enhanced Analysis with Validation
+### Analysis with ATT&CK Validation
 
-For the most comprehensive analysis, enable online validation against the official MITRE ATT&CK framework. This feature downloads the latest framework data and validates your extracted techniques, ensuring accuracy and providing additional context:
+Validation checks every extracted technique against the official ATT&CK data:
 
 ```bash
-python main.py \
-    --path /opt/detection-rules \
-    --output validated_coverage.json \
-    --validate-online \
-    --report detailed_report.json \
-    --log-level INFO
+# Download (and cache) the latest ATT&CK data
+python main.py -p /opt/detection-rules -o validated.json --validate-online --report report.json
+
+# Pin a release (the newest 19.x), useful for reproducible results
+python main.py -p /opt/detection-rules --validate-online --attack-version 19
+
+# Offline: use a STIX bundle you downloaded earlier
+python main.py -p /opt/detection-rules --attack-data-file enterprise-attack.json
 ```
 
-The validation process serves multiple purposes. It identifies and removes invalid technique references that might have crept into your rules through typos or outdated information. It enriches your analysis with official technique names, descriptions, and tactical context. Most importantly, it ensures your coverage analysis reflects the current state of the ATT&CK framework rather than potentially outdated information.
+What validation does:
+
+- **Removes unknown and deprecated techniques** that cannot be shown in Navigator.
+- **Handles revoked techniques.** ATT&CK revokes techniques and names a replacement (for example `T1562.001` was replaced by `T1685` in ATT&CK v19). `--revoked-policy remap` (default) replaces the revoked ID with its successor and lists every remap in the report; `drop` removes it; `keep` leaves it (Navigator will not display revoked techniques). Note that a replacement can be a different level of the hierarchy (a sub-technique can become a technique).
+- **Uses the real tactic list** from the ATT&CK data. ATT&CK v19 split Defense Evasion into Stealth and Defense Impairment; rules that still say Defense Evasion are accepted and flagged.
+- **Stamps the real ATT&CK version** on the layer and in the report.
+
+If validation was requested but the data cannot be loaded, the tool exits with an error (code 2) instead of silently producing unvalidated results. Pass `--allow-unvalidated` to continue anyway; the summary then states that validation was not performed. If a download fails but an older cached copy exists, the cached copy is used and a warning says so.
+
+Downloads come from the [attack-stix-data](https://github.com/mitre-attack/attack-stix-data) repository (STIX 2.1, which includes the release version) and are cached under `$XDG_CACHE_HOME/navtogen` (default `~/.cache/navtogen`) for 24 hours, then revalidated with an ETag so an unchanged 50 MB file is not downloaded again. Use `--cache-dir`, `--no-cache` and `--refresh-attack-data` to control this.
 
 ### Frequency Analysis for Strategic Planning
 
@@ -206,6 +189,23 @@ python main.py \
 ```
 
 Frequency analysis reveals patterns in your detection strategy that might not be immediately obvious. Techniques covered by many rules might indicate either strong security focus or potential redundancy worth optimizing. Techniques covered by very few rules might represent either specialized detections for specific threats or areas where additional coverage could improve your security posture.
+
+## Supported Rule Formats
+
+| Platform | Formats |
+|---|---|
+| Elastic Security | YAML; JSON (Kibana / Detections API); NDJSON exports (many rules per file); TOML as used by the `elastic/detection-rules` repository |
+| Microsoft Sentinel | YAML templates (Azure-Sentinel layout); ARM templates with one or more alert rule resources; API-style JSON |
+
+Files are routed to a parser by **content**, not by extension: each parser scores how well a file matches its format and the best match wins. Files no parser recognizes are counted and listed in the report (`errors.unrecognized_files`) instead of being parsed as the wrong platform.
+
+Notes:
+
+- Sentinel tactic names in CamelCase (`CredentialAccess`) and Elastic names ("Credential Access") are both normalized to ATT&CK short names.
+- The Sentinel `tags` field is ignored for ATT&CK data. Technique IDs mentioned only in free text are not counted unless you pass `--text-fallback`.
+- Disabled rules are excluded from coverage unless you pass `--include-disabled`.
+- Elastic rules declare which tactic each technique belongs to; `--tactic-scoped` keeps that pairing in the layer so a technique that exists under several tactics is only coloured under the declared one. This flag is new and has not been checked in the Navigator UI itself, so compare against the default output the first time you use it.
+- YAML 1.1 quirk: an unquoted `name: Off`/`No`/`On`/`Yes` is read as a boolean by YAML parsers. Quote such names.
 
 ## Analysis Modes
 
@@ -312,7 +312,7 @@ Finally, the framework integration enriches your analysis with official techniqu
 
 ### Modular Design Philosophy
 
-The Enterprise MITRE ATT&CK Coverage Analyzer is built using a modular architecture that separates concerns and makes the system easy to understand, maintain, and extend. Rather than building everything in a single large file, the system is organized into specialized modules that each handle specific aspects of the analysis process.
+NavToGen is built using a modular architecture that separates concerns and makes the system easy to understand, maintain, and extend. Rather than building everything in a single large file, the system is organized into specialized modules that each handle specific aspects of the analysis process.
 
 This modular approach provides several significant advantages. Individual components can be developed, tested, and maintained independently, making the system more reliable and easier to troubleshoot. New features or support for additional SIEM platforms can be added without modifying existing code, reducing the risk of introducing bugs or breaking existing functionality.
 
@@ -346,55 +346,46 @@ Error handling is designed to be secure by default, providing useful information
 
 ### Performance Architecture
 
-The system is designed to handle large-scale enterprise rule repositories efficiently through several performance optimization strategies. Concurrent processing allows multiple rules to be parsed simultaneously when system resources permit, dramatically reducing analysis time for large rule sets.
-
-Memory management is optimized to avoid loading entire rule repositories into memory at once, instead processing files in a streaming fashion that maintains consistent memory usage regardless of repository size. This approach ensures the tool can handle repositories containing thousands of rules without exhausting system resources.
-
-The MITRE ATT&CK framework integration includes intelligent caching that minimizes network requests while ensuring data freshness. The system downloads framework data once per analysis session and reuses it for all validation operations, avoiding unnecessary network overhead.
+Each file is read and decoded once, then offered to every parser for scoring. Parsing runs in a thread pool for larger rule sets, and results are combined on the calling thread in input order so runs are deterministic. ATT&CK data is downloaded at most once per cache period and shared by all validation. Whole rule sets are held in memory (a rule is a small object); there is no streaming mode.
 
 ## Configuration
 
-### Environment Variables
+### Command-line options
 
-The analyzer supports several environment variables that control system behavior without requiring command-line arguments for every execution:
+Run `python main.py --help` for the full list. The main groups:
 
-```bash
-# Control logging behavior
-export MITRE_ANALYZER_LOG_LEVEL=INFO
-export MITRE_ANALYZER_LOG_FILE=/var/log/mitre-analyzer.log
+| Option | Purpose |
+|---|---|
+| `-p/--path`, `-o/--output` | Rules directory; layer output path (missing directories are created) |
+| `--comparison-mode`, `--frequency-mode`, `--temporal-analysis` | Analysis modes |
+| `--validate-online`, `--attack-data-file`, `--attack-version`, `--revoked-policy`, `--allow-unvalidated` | ATT&CK validation |
+| `--cache-dir`, `--no-cache`, `--refresh-attack-data` | ATT&CK data cache |
+| `--rule-type`, `--include-disabled`, `--text-fallback` | Which rules and what counts as coverage |
+| `--tactic-scoped`, `--platforms` | Layer options. No platform filter is applied unless you pass `--platforms` |
+| `--report` | Detailed JSON report. A bare filename is written under `output/` |
+| `--max-workers`, `--no-threading` | Parallelism |
+| `--log-level`, `--log-file`, `--quiet` | Logging |
 
-# Configure performance settings
-export MITRE_ANALYZER_MAX_WORKERS=4
-export MITRE_ANALYZER_MAX_FILE_SIZE=10485760  # 10MB
+### Exit codes
 
-# Control feature availability
-export MITRE_ANALYZER_ENABLE_ONLINE_VALIDATION=true
-export MITRE_ANALYZER_CACHE_DURATION_HOURS=24
-```
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | Analysis failed (no rules found or parsed, no techniques, output could not be written) |
+| 2 | Invalid arguments, or validation was requested but the ATT&CK data could not be loaded |
+| 130 | Interrupted |
 
-These environment variables prove particularly useful in automated environments where consistent configuration is important, or in containerized deployments where configuration through environment variables is preferred over command-line arguments.
+### Constants
 
-### Configuration Files
-
-For more complex deployment scenarios, the system supports configuration through the `config.py` file, which contains all system constants and default values. This centralized configuration makes it easy to customize the tool for specific organizational needs or deployment environments.
-
-Organizations can customize file size limits, timeout values, supported file extensions, security validation parameters, and many other aspects of system behavior by modifying the configuration file. This approach provides flexibility while maintaining security and reliability through validated configuration options.
-
-### Customization Options
-
-The modular architecture makes it straightforward to customize the tool for specific organizational needs. Common customizations include adding support for additional SIEM platforms, implementing custom scoring algorithms for Navigator layers, or integrating with external systems for automated reporting.
-
-Adding support for a new SIEM platform requires creating a new parser class that implements the standard parser interface. The system will automatically recognize and use the new parser without requiring changes to other components.
-
-Custom scoring algorithms can be implemented by adding new functions to the layer generator and configuring them through command-line options or configuration files. This flexibility allows organizations to implement scoring strategies that reflect their specific threat models or business priorities.
+Limits such as the maximum file size, directory depth, forbidden system path prefixes and default worker count are constants in `config.py`. There are no environment-variable overrides (earlier versions of this README described some; they never existed).
 
 ## Troubleshooting
 
 ### Common Issues and Solutions
 
-**Issue**: The analyzer reports "No suitable parser found" for rule files that should be supported.
+**Issue**: Files are reported as an unrecognized format.
 
-**Solution**: This usually indicates that the rule files don't match the expected format patterns. Check that Elastic rules use proper YAML structure with `threat` sections, and Sentinel rules include recognizable fields like `displayName` or `kind`. Enable DEBUG logging to see detailed format detection information.
+**Solution**: A parser claims a file only if it contains enough fields of its format (for example `rule_id`, `risk_score`, `threat` for Elastic; `kind`, `queryFrequency`, `tactics`, `relevantTechniques` for Sentinel). Run with `--log-level DEBUG` to see each parser's score per file, and check `errors.unrecognized_files` in the report.
 
 **Issue**: Analysis completes but shows very few techniques extracted from rules.
 
@@ -402,11 +393,11 @@ Custom scoring algorithms can be implemented by adding new functions to the laye
 
 **Issue**: The tool fails with network-related errors when using `--validate-online`.
 
-**Solution**: Online validation requires internet access to download the latest MITRE ATT&CK framework data. If you're behind a corporate firewall or proxy, you may need to configure proxy settings or disable online validation using local validation only.
+**Solution**: Validation needs ATT&CK data. Behind a proxy, set `HTTPS_PROXY`. Offline, download `enterprise-attack.json` from attack-stix-data once and use `--attack-data-file`. A recent cached copy is reused automatically.
 
 **Issue**: Analysis is very slow for large rule repositories.
 
-**Solution**: Enable concurrent processing with `--max-workers` set to an appropriate value for your system (typically 2-8 workers). Ensure you have adequate memory and that your storage system can handle multiple concurrent file reads efficiently.
+**Solution**: Files are read once and parsed in a thread pool when there are more than 10 of them (`--max-workers`). YAML parsing is CPU-bound, so extra threads help less than they would for I/O; the PyYAML C extension (`libyaml`) is used automatically when available.
 
 ### Debugging Techniques
 
@@ -440,53 +431,40 @@ For issues not covered in this troubleshooting section, several resources are av
 
 ### Development Setup
 
-Contributors should set up a complete development environment that includes testing tools and code quality utilities:
-
 ```bash
-# Clone and set up the repository
-git clone https://github.com/your-organization/enterprise-mitre-analyzer.git
-cd enterprise-mitre-analyzer
-
-# Create development environment
-python -m venv dev-env
-source dev-env/bin/activate  # Windows: dev-env\Scripts\activate
-
-# Install all dependencies including development tools
-pip install -r requirements.txt
-pip install pytest pytest-cov black flake8 mypy
-
-# Run the test suite to verify everything works
-python -m pytest --cov=. tests/
-
-# Check code formatting and style
-black --check .
-flake8 .
-mypy .
+git clone https://github.com/Pr0kythera/NavToGen.git
+cd NavToGen
+python -m venv venv && source venv/bin/activate
+pip install -r requirements-dev.txt
+python -m pytest --cov=.
+ruff check .
 ```
 
 ### Code Style and Standards
 
-The project follows established Python coding standards and uses automated tools to maintain code quality and consistency. All code should be formatted using Black, which provides consistent formatting that eliminates debates about style preferences.
+The project follows established Python coding standards and uses automated tools to maintain code quality and consistency. Lint with `ruff` (currently errors and pyflakes rules only).
 
 Code should include comprehensive docstrings that explain not just what functions do, but why they exist and how they fit into the broader system architecture. This documentation is crucial for maintaining the system as it evolves and helping new contributors understand the codebase.
 
-Type hints should be used throughout the codebase to improve code clarity and catch potential issues early in the development process. The mypy type checker is used to validate type annotations and identify potential type-related bugs.
+Type hints are used throughout; a mypy pass is tracked in TODO.md.
 
 ### Adding New SIEM Platform Support
 
-One of the most valuable contributions is adding support for additional SIEM platforms. The modular architecture makes this process straightforward by providing a clear interface that new parsers must implement.
+Create a parser class in the `parsers` package that inherits from `BaseRuleParser` and implement three methods:
 
-To add support for a new platform, create a new parser class in the `parsers` package that inherits from `BaseRuleParser`. The new parser must implement three key methods: `can_parse()` to identify files it can handle, `parse()` to extract technique information from rule files, and `get_supported_extensions()` to specify file types it supports.
+- `get_supported_extensions()`: the file extensions it can read.
+- `score(records, file_path)`: given the decoded records of a file (a list of dicts), return how confident you are that they are your format. Return 0 if they are not. The repository picks the highest score.
+- `parse_records(records, file_path)`: convert records into `DetectionRule` objects, skipping records that are not rules, and call `update_statistics()` once per rule.
 
-The parser should understand the specific format used by the target SIEM platform and extract MITRE ATT&CK technique references from the appropriate fields. Study the existing Elastic and Sentinel parsers to understand the expected patterns and error handling approaches.
+File reading, size limits, UTF-8 handling and decoding of YAML, JSON, TOML and NDJSON are done for you (`read_rule_file`, `decode_structured`); `parse(path)` and `can_parse(path)` are provided on top of the three methods. Register the parser in `RuleRepository.__init__`. Study the Elastic and Sentinel parsers for the expected patterns.
 
 ### Testing Guidelines
 
-All new features and bug fixes should include comprehensive tests that verify correct behavior under various conditions. The test suite uses pytest and includes both unit tests for individual components and integration tests for end-to-end scenarios.
+All new features and bug fixes should include comprehensive tests that verify correct behavior under various conditions. The test suite uses pytest; `tests/` contains unit tests per module and end-to-end CLI tests. Every bug fix should come with a regression test.
 
 When adding new parsers, include test cases that cover various rule formats, edge cases, and error conditions. Test files should use sanitized or synthetic rule data that doesn't expose real organizational security information.
 
-Performance tests should be included for features that might impact analysis speed, especially when processing large rule repositories. These tests help identify performance regressions and guide optimization efforts.
+
 
 ## Security Considerations
 
@@ -522,6 +500,6 @@ The MIT License was chosen to encourage adoption and contribution while providin
 
 ---
 
-**Ready to transform your detection rule analysis?** Start with the [Quick Start](#quick-start) guide and discover how the Enterprise MITRE ATT&CK Coverage Analyzer can provide unprecedented visibility into your detection capabilities.
+**Ready to transform your detection rule analysis?** Start with the [Quick Start](#quick-start) guide and discover how NavToGen can show where your detections cover ATT&CK.
 
-For questions, issues, or contributions, please visit our [GitHub repository](https://github.com/your-organization/enterprise-mitre-analyzer) or contact the development team.
+For questions, issues, or contributions, please visit our [GitHub repository](https://github.com/Pr0kythera/NavToGen) .

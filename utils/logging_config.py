@@ -94,25 +94,18 @@ class ColoredFormatter(logging.Formatter):
         Returns:
             bool: True if colors should be used, False otherwise
         """
-        # Check if we're in a terminal that supports colors
-        if not hasattr(sys.stdout, 'isatty') or not sys.stdout.isatty():
+        # Explicit user preferences win over any heuristic (https://no-color.org)
+        if os.environ.get('NO_COLOR', ''):
             return False
-        
-        # Check environment variables that indicate color support
-        if 'TERM' in os.environ:
-            term = os.environ['TERM'].lower()
-            if 'color' in term or term in ('xterm', 'xterm-256color', 'screen'):
-                return True
-        
-        # Check for explicit color preferences
         if os.environ.get('FORCE_COLOR', '').lower() in ('1', 'true', 'yes'):
             return True
-        
-        if os.environ.get('NO_COLOR', '').lower() in ('1', 'true', 'yes'):
+
+        # Otherwise only color real terminals that advertise color support
+        if not hasattr(sys.stdout, 'isatty') or not sys.stdout.isatty():
             return False
-        
-        # Default to no colors if we can't determine support
-        return False
+
+        term = os.environ.get('TERM', '').lower()
+        return 'color' in term or term in ('xterm', 'xterm-256color', 'screen')
 
 
 class PerformanceFilter(logging.Filter):

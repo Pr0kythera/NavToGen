@@ -3,6 +3,12 @@
 Created from the code review of 2026-11-09 plus the owner's feature list.
 Review date matters: ATT&CK was at v20 (13 Oct 2026) when this was written.
 
+Status (updated after the first fix pass)
+- Sections 1-4 (bugs and hygiene) are done and covered by 187 pytest tests; `[~]` marks a partly done item.
+- Not verified in the Navigator UI (cannot be run here): `expandedSubtechniques: annotated` (H2), `--tactic-scoped` behavior when scoped and unscoped entries mix (H7), and platform-filter behavior (H3 removed the default filter, so this no longer affects default output).
+- Known caveat: YAML 1.1 reads unquoted `name: Off/No/On/Yes` as a boolean, so such a name is lost before the parser sees it (documented in the README).
+- Not done: a mypy pass (CI runs ruff `E9,F` and pytest only).
+
 Legend
 - ID prefixes: D = design decision, C = critical bug, H = high, M = medium, L = low, F = feature.
 - Evidence tags: [V] reproduced by running code, [R] found by reading code only, [U] upstream fact that must be re-verified before relying on it.
@@ -11,108 +17,101 @@ Legend
 
 ---
 
-## 0. Design decisions needed before the schema work (blockers for Track B)
+## 0. Design decisions (resolved)
 
-- [ ] **D1. Field ownership and regeneration semantics.** The per-rule JSON mixes fields this tool derives (regenerated every run) with fields other tools populate (TP/FP counts, BAS results, environment). A naive re-run would overwrite externally supplied data. Decide one of:
-  - (a) single file per rule with top-level blocks that each declare an owner, and a merge-by-`detection_id` step that never touches blocks it does not own (recommended), or
-  - (b) two files per rule: tool-owned `<id>.detection.json` and externally-owned sidecar `<id>.outcomes.json`.
-  Either way, ship a documented merge algorithm and a test that proves externally owned blocks survive regeneration.
-- [ ] **D2. Identity.** Define `detection_id` (stable UUID) versus `source_rule_id`. Sentinel templates carry `id`. Elastic has a stable `rule_id` and a random internal `id` [U: Kibana API docs]. Sigma uses `id`. When no GUID exists, synthesize a UUIDv5 from (source repo, relative path) and set `id_synthesized: true`. Decide what happens on rename or move.
-- [ ] **D3. Terminology.** Several requested fields are overloaded and need distinct names:
-  - `platform` -> `siem_platform` (Elastic/Sentinel) vs `target_platforms` (Windows/Linux/Azure/GCP/...).
-  - revision count -> `source_version` (as written in the rule) vs `revision_count` (derived from VCS history). These are not the same thing: Sentinel template `version` is a semver string (observed `1.0.3`), Elastic `version` is an integer that the API auto-increments [U].
-  - lookback -> rule-level (`queryPeriod`, Elastic `from`) vs query-internal windows (`ago()`, `bin()`, `make-series`). Store both, normalized to ISO 8601 durations.
-  - environment -> an array of environment objects, not a single string (prod/dev/test, per tenant or workspace).
-- [ ] **D4. LLM policy.** Rules describe an organization's detection capability (the README itself says they are sensitive). Decide: opt-in only, provider is pluggable (include a local-model option), nothing is sent by default, results are cached by content hash, and every LLM-produced field records model, prompt hash, timestamp and `reviewed: false`. See B5.
-- [ ] **D5. Align with existing formats before inventing fields.** Compare with Sigma rule metadata and the MITRE ATT&CK Data Model JSON schemas [U] and reuse names where they fit. Publish our schema as JSON Schema 2020-12 with a `$id` and a `schema_version` (semver).
-- [ ] **D6. Sensitivity classification.** Environment names, tenant/workspace IDs and outcome counts are sensitive. Add a `handling` marker to the schema and document that generated files must be treated as confidential. Do not log schema contents at INFO.
-- [ ] **D7. Sequencing.** Do not start Track B until C1-C7 are fixed. The schema's `attack` block depends on a working validator, a correct tactic model and revoked-technique handling.
+- [x] **D1. Two files per detection.** `<detection_id>.detection.json` is owned by this tool and is regenerated on every run. `<detection_id>.enrichment.json` is owned by other tools (LLM analysis, outcomes, BAS results, environment). This tool never overwrites an existing enrichment file; when none exists it may write an empty skeleton so other tools have a template. Staleness is handled by content hash (see D3 and B6).
+- [x] **D2. Identity.** Use the rule's own UUID when it has one (Sentinel `id`, Elastic `rule_id`, Sigma `id`); otherwise generate one. Recommendation: generate a deterministic UUIDv5 from (source repository, relative path) rather than a random UUID, so regenerating does not orphan the enrichment file. Record which it was in `id_origin` (`source` or `generated`). Open point: a file rename changes a generated ID; document it.
+- [x] **D3. Field names.** Proposal below (section 5, "Naming standard"); needs a final yes from the owner when the example Sentinel schema arrives.
+- [x] **D4. LLM output: schema only.** The tool does NOT call any LLM and has no provider interface, redaction layer, cache or evaluation set. It only defines where LLM-produced text goes (`enrichment.analysis`) and the provenance fields describing how it was produced. How or whether organizations use LLMs is up to them.
+- [x] **D5. Align with existing formats before inventing fields** (Sigma metadata, ATT&CK Data Model schemas [U]). Publish JSON Schema 2020-12 with `$id` and `schema_version`.
+- [x] **D6. Sensitivity field.** `handling.sensitivity` (enum) plus `handling.notes` on both files. Generated files are to be treated as confidential by default; do not log schema contents at INFO.
+- [x] **D7. Sequencing.** Bugs first (done), then Track B.
 
 ---
 
 ## 1. Critical bugs (wrong or silently incomplete results)
 
-- [ ] **C1. `--validate-online` can never succeed [V].** `validators/mitre_validator.py:349-373` `_process_matrix_tactics` is a stub that returns 0, and `_process_attack_data` (line 288) requires `tactics_found > 0`, so it always returns False. Live data log: "Only found 0 tactics". `main.py:156` then continues unvalidated and exits 0.
-  - [ ] Derive tactics from `x-mitre-tactic` objects (`x_mitre_shortname`), not the matrix (and `tactic_refs` is a flat string list, not a list of lists).
-  - [ ] Make failure explicit: non-zero exit, or a loud summary line, when `--validate-online` was requested and validation did not run.
-  - [ ] Add a regression test using a trimmed real-structure STIX fixture (a synthetic bundle reproduced the bug).
-- [ ] **C2. Tactic model out of date [V].** ATT&CK v19 split Defense Evasion into Stealth and Defense Impairment (15 tactics); v20 is current. `config.py:43-58` `VALID_TACTICS` has 14 and rejects `stealth` and `defense-impairment`; `config.py:39` default version is 17.
-  - [ ] Load valid tactics from the ATT&CK data when available; keep a bundled fallback list (15 tactics, versioned).
-  - [ ] Support old and new names (map legacy `defense-evasion` for rules written before v19, record which tactic names were seen).
-  - [ ] Bump the default ATT&CK version and make it derived from the loaded data where possible.
-- [ ] **C3. Sentinel tactics mostly dropped [V].** `models/detection_rule.py:148` only swaps spaces/underscores, so CamelCase (`CredentialAccess`, `PrivilegeEscalation`, `DefenseEvasion`, `LateralMovement`, `InitialAccess`) is rejected; 2 of about 5 tactics captured on the fixtures.
-  - [ ] Normalize CamelCase to hyphenated form (split on capitals) before validation; add an alias table for Sentinel-specific names (e.g. `PreAttack`).
-  - [ ] Stop treating Sentinel `tags` as an ATT&CK source (`parsers/sentinel_parser.py:80`); it produces noise such as `Solorigate`, `NOBELIUM`, `DEV-0537`.
-- [ ] **C4. Revoked and deprecated techniques accepted as valid [V].** Live data: 149 revoked, 12 deprecated, 157 `revoked-by` relationships. v19 revoked broadly used techniques (e.g. Impair Defenses, Indicator Blocking, Clear Windows Event Logs).
-  - [ ] Validator must expose `is_revoked`, `is_deprecated` and `replaced_by`.
-  - [ ] Policy flag: warn, remap via `revoked-by`, or drop. Report remaps in the output.
-  - [ ] Count rules still mapped to revoked IDs in the report (a useful maintenance metric).
-- [ ] **C5. Elastic ingestion limited to hand-written YAML [V].**
-  - [ ] Add TOML (the `detection-rules` repo layout [U]) and NDJSON (Kibana export) parsing; extend `SUPPORTED_EXTENSIONS` and discovery.
-  - [ ] Content-based routing for `.json` instead of the extension fallback at `core/RuleRepository.py:441-444` (an Elastic-shaped JSON file was silently parsed as Sentinel with zero techniques).
-  - [ ] Relax the required-fields check at `parsers/elastic_parser.py:416`.
-  - [ ] When no parser matches, report it; never return an empty rule silently.
-- [ ] **C6. Report path and JSON serialization [V].**
-  - [ ] `main.py:367`: sanitize the filename component only, never the whole path (`output/rep.json` currently becomes `output_rep.json` in the CWD).
-  - [ ] `main.py:370`: serialize sets as sorted lists (custom encoder) instead of `default=str`.
-  - [ ] Create the output directory when it does not exist (see M3).
-- [ ] **C7. Temporal analysis ingests its own outputs [V].** The epilog recommends `--snapshots-directory output/` and the tool writes `executive_summary_*.json` and `time_series_data_*.json` there; the `*.json` glob (`core/temporal_analysis.py:297`) loads them as 0-rule snapshots.
-  - [ ] Identify snapshot files by content (required keys) and skip everything else with a debug message.
-  - [ ] Write temporal outputs to a separate subdirectory or a distinct filename pattern.
-  - [ ] Stop reverse-engineering rule counts from Navigator scores (`temporal_analysis.py:171`); read from the coverage report, or embed counts in layer metadata.
-  - [ ] Fix `tactics` metadata key mismatch (line 177) so Navigator-layer snapshots can report tactics.
+- [x] **C1. `--validate-online` can never succeed [V].** `validators/mitre_validator.py:349-373` `_process_matrix_tactics` is a stub that returns 0, and `_process_attack_data` (line 288) requires `tactics_found > 0`, so it always returns False. Live data log: "Only found 0 tactics". `main.py:156` then continues unvalidated and exits 0.
+  - [x] Derive tactics from `x-mitre-tactic` objects (`x_mitre_shortname`), not the matrix (and `tactic_refs` is a flat string list, not a list of lists).
+  - [x] Make failure explicit: non-zero exit, or a loud summary line, when `--validate-online` was requested and validation did not run.
+  - [x] Add a regression test using a trimmed real-structure STIX fixture (a synthetic bundle reproduced the bug).
+- [x] **C2. Tactic model out of date [V].** ATT&CK v19 split Defense Evasion into Stealth and Defense Impairment (15 tactics); v20 is current. `config.py:43-58` `VALID_TACTICS` has 14 and rejects `stealth` and `defense-impairment`; `config.py:39` default version is 17.
+  - [x] Load valid tactics from the ATT&CK data when available; keep a bundled fallback list (15 tactics, versioned).
+  - [x] Support old and new names (map legacy `defense-evasion` for rules written before v19, record which tactic names were seen).
+  - [x] Bump the default ATT&CK version and make it derived from the loaded data where possible.
+- [x] **C3. Sentinel tactics mostly dropped [V].** `models/detection_rule.py:148` only swaps spaces/underscores, so CamelCase (`CredentialAccess`, `PrivilegeEscalation`, `DefenseEvasion`, `LateralMovement`, `InitialAccess`) is rejected; 2 of about 5 tactics captured on the fixtures.
+  - [x] Normalize CamelCase to hyphenated form (split on capitals) before validation; add an alias table for Sentinel-specific names (e.g. `PreAttack`).
+  - [x] Stop treating Sentinel `tags` as an ATT&CK source (`parsers/sentinel_parser.py:80`); it produces noise such as `Solorigate`, `NOBELIUM`, `DEV-0537`.
+- [x] **C4. Revoked and deprecated techniques accepted as valid [V].** Live data: 149 revoked, 12 deprecated, 157 `revoked-by` relationships. v19 revoked broadly used techniques (e.g. Impair Defenses, Indicator Blocking, Clear Windows Event Logs).
+  - [x] Validator must expose `is_revoked`, `is_deprecated` and `replaced_by`.
+  - [x] Policy flag: warn, remap via `revoked-by`, or drop. Report remaps in the output.
+  - [x] Count rules still mapped to revoked IDs in the report (a useful maintenance metric).
+- [x] **C5. Elastic ingestion limited to hand-written YAML [V].**
+  - [x] Add TOML (the `detection-rules` repo layout [U]) and NDJSON (Kibana export) parsing; extend `SUPPORTED_EXTENSIONS` and discovery.
+  - [x] Content-based routing for `.json` instead of the extension fallback at `core/RuleRepository.py:441-444` (an Elastic-shaped JSON file was silently parsed as Sentinel with zero techniques).
+  - [x] Relax the required-fields check at `parsers/elastic_parser.py:416`.
+  - [x] When no parser matches, report it; never return an empty rule silently.
+- [x] **C6. Report path and JSON serialization [V].**
+  - [x] `main.py:367`: sanitize the filename component only, never the whole path (`output/rep.json` currently becomes `output_rep.json` in the CWD).
+  - [x] `main.py:370`: serialize sets as sorted lists (custom encoder) instead of `default=str`.
+  - [x] Create the output directory when it does not exist (see M3).
+- [x] **C7. Temporal analysis ingests its own outputs [V].** The epilog recommends `--snapshots-directory output/` and the tool writes `executive_summary_*.json` and `time_series_data_*.json` there; the `*.json` glob (`core/temporal_analysis.py:297`) loads them as 0-rule snapshots.
+  - [x] Identify snapshot files by content (required keys) and skip everything else with a debug message.
+  - [x] Write temporal outputs to a separate subdirectory or a distinct filename pattern.
+  - [x] Stop reverse-engineering rule counts from Navigator scores (`temporal_analysis.py:171`); read from the coverage report, or embed counts in layer metadata.
+  - [x] Fix `tactics` metadata key mismatch (line 177) so Navigator-layer snapshots can report tactics.
 
 ---
 
 ## 2. High priority
 
-- [ ] **H1. Disabled rules counted as coverage [R].** `rule.enabled` is never read outside the parsers. Exclude by default; add `--include-disabled`; report the count.
-- [ ] **H2. Parent techniques never emitted [V].** Only `T1003.001` -> no `T1003` entry. `get_parent_techniques()` is unused.
-  - [ ] Emit parent entries (without double counting) and/or set layout `showAggregateScores` and `expandedSubtechniques` (`models/navigator_layer_model.py:382-388`) [U: layer format 4.5].
-- [ ] **H3. Stale default platform filter [V/R].** `navigator_layer_model.py:303-306` lists `Azure AD`, `Office 365`, `Network`; live data uses `Identity Provider`, `Office Suite`, `Network Devices`, `ESXi`, `Containers`, `IaaS`, `SaaS`, `PRE`. Navigator behavior with unknown names is untested. Default to no platform filter; make it opt-in via a flag; build the list from loaded data.
-- [ ] **H4. `--attack-version` ignored outside coverage mode [R].** `generators/layer_generator.py:226,320` use the default. Pass it through; validate against loaded data.
-- [ ] **H5. Wrong data version [V].** `mitre_validator.py:261` records STIX `spec_version` ("2.0"). The `mitre/cti` file has no `x-mitre-collection`. Use a source that exposes the real version (e.g. the versioned `attack-stix-data` files [U]) or read it from objects' `x_mitre_attack_spec_version`/release metadata, and record it in every output.
-- [ ] **H6. Retry configuration inert [V].** `mitre_validator.py:110`: `Retry(status=[...])` should be `status_forcelist=[...]`.
-- [ ] **H7. Tactic-technique pairing lost [R].** Keep the (tactic, technique) pairs from Elastic `threat[]` and emit a Navigator `tactic` field so multi-tactic techniques are not lit under every tactic.
-- [ ] **H8. No tests, no CI [V].**
-  - [ ] pytest suite with fixtures for Elastic YAML/TOML/NDJSON and Sentinel YAML/ARM JSON.
-  - [ ] Regression tests for C1-C7, H1-H6 first.
-  - [ ] GitHub Actions: pytest, flake8/ruff, mypy; Python version matrix (see M11).
-  - [ ] `pyproject.toml` with dependencies split into runtime and dev extras.
+- [x] **H1. Disabled rules counted as coverage [R].** `rule.enabled` is never read outside the parsers. Exclude by default; add `--include-disabled`; report the count.
+- [x] **H2. Parent techniques never emitted [V].** Only `T1003.001` -> no `T1003` entry. `get_parent_techniques()` is unused.
+  - [x] Emit parent entries (without double counting) and/or set layout `showAggregateScores` and `expandedSubtechniques` (`models/navigator_layer_model.py:382-388`) [U: layer format 4.5].
+- [x] **H3. Stale default platform filter [V/R].** `navigator_layer_model.py:303-306` lists `Azure AD`, `Office 365`, `Network`; live data uses `Identity Provider`, `Office Suite`, `Network Devices`, `ESXi`, `Containers`, `IaaS`, `SaaS`, `PRE`. Navigator behavior with unknown names is untested. Default to no platform filter; make it opt-in via a flag; build the list from loaded data.
+- [x] **H4. `--attack-version` ignored outside coverage mode [R].** `generators/layer_generator.py:226,320` use the default. Pass it through; validate against loaded data.
+- [x] **H5. Wrong data version [V].** `mitre_validator.py:261` records STIX `spec_version` ("2.0"). The `mitre/cti` file has no `x-mitre-collection`. Use a source that exposes the real version (e.g. the versioned `attack-stix-data` files [U]) or read it from objects' `x_mitre_attack_spec_version`/release metadata, and record it in every output.
+- [x] **H6. Retry configuration inert [V].** `mitre_validator.py:110`: `Retry(status=[...])` should be `status_forcelist=[...]`.
+- [x] **H7. Tactic-technique pairing lost [R].** Keep the (tactic, technique) pairs from Elastic `threat[]` and emit a Navigator `tactic` field so multi-tactic techniques are not lit under every tactic.
+- [x] **H8. No tests, no CI [V].**
+  - [x] pytest suite with fixtures for Elastic YAML/TOML/NDJSON and Sentinel YAML/ARM JSON.
+  - [x] Regression tests for C1-C7, H1-H6 first.
+  - [x] GitHub Actions: pytest, flake8/ruff, mypy; Python version matrix (see M11).
+  - [x] `pyproject.toml` with dependencies split into runtime and dev extras.
 
 ---
 
 ## 3. Medium priority
 
-- [ ] **M1.** Forbidden-path check is a substring match (`validators/security_validator.py:118-121`, `config.py:62-70`) and blocks `/home/me/proj/etc/rules/`, `/data/sys/rules/`, and everything under `/root/` [V]. Match on path components of the resolved path, and let the user opt out of `/root/` or configure the list.
-- [ ] **M2.** Symlink check is dead code (`security_validator.py:165,185`: `.resolve()` runs before `.is_symlink()`) [V]. Check before resolving; decide the policy (follow, refuse, or refuse when the target escapes the root).
-- [ ] **M3.** `-o results/x.json` fails when `results/` does not exist [V]. Create the parent directory.
-- [ ] **M4.** Depth calculation uses `root.replace(directory_path, '')` (`core/RuleRepository.py:181`); off by one with a trailing slash, and files at the depth limit are skipped [R]. Use `Path.relative_to`.
-- [ ] **M5.** Elastic risk-score to severity thresholds (75/50/25 in `parsers/elastic_parser.py:226-234`) may not match Elastic's documented bands (I recall low <22, medium 22-47, high 48-73, critical >=74) [U]. Verify and fix.
-- [ ] **M6.** `risk_score`/`priority` stored as lowercase strings in `parsers/base_parser.py:196` [R]. Keep a numeric `risk_score` separate from the normalized `severity`.
-- [ ] **M7.** Performance [R]: each file is read and validated several times (every parser's `can_parse`, then `parse`); parsing stats counters are not locked; `get_statistics()` returns a shallow copy. Read once, pass content through; consider process-based parallelism for CPU-bound YAML; return deep copies.
-- [ ] **M8.** `errors='replace'` makes the `UnicodeDecodeError` branch unreachable (`base_parser.py:244,256`) [R]. Decide: strict with an error, or replace and record a parse warning.
-- [ ] **M9.** Sentinel parser [R]:
-  - [ ] ARM templates with multiple `alertRules` resources return only the first (`sentinel_parser.py:202-207`).
-  - [ ] Dead `displayName` fallback (line 304).
-  - [ ] Text-scan fallback pulls T-IDs from query text and can create false coverage; make it opt-in and tag the source.
-- [ ] **M10.** Temporal analysis [R]: coverage denominator hard-coded at 800 (`temporal_analysis.py:68`; v19 has 222 techniques + 475 sub-techniques [U: v19 release notes]); fixed CSV filenames are overwritten; naive vs timezone-aware timestamps can break sorting.
-- [ ] **M11.** README claims Python 3.8+ but `tuple[int, int]` annotations (`sentinel_parser.py:340`, `elastic_parser.py:246`) need 3.9+; 3.8 and 3.9 are end-of-life. Set the minimum to a supported version and say so in the README and CI.
-- [ ] **M12.** Online fetch downloads about 49 MB on every run with no on-disk cache [V]. Add a cache directory with ETag/If-Modified-Since or a pinned version; offline mode that uses the cache; `--attack-data-file` for air-gapped use. Decide between `mitre/cti` (STIX 2.0) and `attack-stix-data` (STIX 2.1) [U: both maintained].
+- [x] **M1.** Forbidden-path check is a substring match (`validators/security_validator.py:118-121`, `config.py:62-70`) and blocks `/home/me/proj/etc/rules/`, `/data/sys/rules/`, and everything under `/root/` [V]. Match on path components of the resolved path, and let the user opt out of `/root/` or configure the list.
+- [x] **M2.** Symlink check is dead code (`security_validator.py:165,185`: `.resolve()` runs before `.is_symlink()`) [V]. Check before resolving; decide the policy (follow, refuse, or refuse when the target escapes the root).
+- [x] **M3.** `-o results/x.json` fails when `results/` does not exist [V]. Create the parent directory.
+- [x] **M4.** Depth calculation uses `root.replace(directory_path, '')` (`core/RuleRepository.py:181`); off by one with a trailing slash, and files at the depth limit are skipped [R]. Use `Path.relative_to`.
+- [x] **M5.** Elastic risk-score to severity thresholds (75/50/25 in `parsers/elastic_parser.py:226-234`) may not match Elastic's documented bands (I recall low <22, medium 22-47, high 48-73, critical >=74) [U]. Verify and fix.
+- [x] **M6.** `risk_score`/`priority` stored as lowercase strings in `parsers/base_parser.py:196` [R]. Keep a numeric `risk_score` separate from the normalized `severity`.
+- [~] **M7.** (partly done: files are read once, stats aggregated on the calling thread, results deterministic, deep-copied statistics; NOT done: process-based parallelism for CPU-bound YAML, which needs measurement on a large rule set first) Performance [R]: each file is read and validated several times (every parser's `can_parse`, then `parse`); parsing stats counters are not locked; `get_statistics()` returns a shallow copy. Read once, pass content through; consider process-based parallelism for CPU-bound YAML; return deep copies.
+- [x] **M8.** `errors='replace'` makes the `UnicodeDecodeError` branch unreachable (`base_parser.py:244,256`) [R]. Decide: strict with an error, or replace and record a parse warning.
+- [x] **M9.** Sentinel parser [R]:
+  - [x] ARM templates with multiple `alertRules` resources return only the first (`sentinel_parser.py:202-207`).
+  - [x] Dead `displayName` fallback (line 304).
+  - [x] Text-scan fallback pulls T-IDs from query text and can create false coverage; make it opt-in and tag the source.
+- [x] **M10.** Temporal analysis [R]: coverage denominator hard-coded at 800 (`temporal_analysis.py:68`; v19 has 222 techniques + 475 sub-techniques [U: v19 release notes]); fixed CSV filenames are overwritten; naive vs timezone-aware timestamps can break sorting.
+- [x] **M11.** README claims Python 3.8+ but `tuple[int, int]` annotations (`sentinel_parser.py:340`, `elastic_parser.py:246`) need 3.9+; 3.8 and 3.9 are end-of-life. Set the minimum to a supported version and say so in the README and CI.
+- [x] **M12.** Online fetch downloads about 49 MB on every run with no on-disk cache [V]. Add a cache directory with ETag/If-Modified-Since or a pinned version; offline mode that uses the cache; `--attack-data-file` for air-gapped use. Decide between `mitre/cti` (STIX 2.0) and `attack-stix-data` (STIX 2.1) [U: both maintained].
 
 ---
 
 ## 4. Low priority and hygiene
 
-- [ ] **L1.** README documents `MITRE_ANALYZER_*` environment variables that no code reads [V]. Implement or remove.
-- [ ] **L2.** Placeholder repo URLs in README and `main.py:668`; README claims streaming/memory behavior that does not exist [V].
-- [ ] **L3.** Delete `package_inits.py` (stale, wrong module names). Add real exports to `parsers/__init__.py`.
-- [ ] **L4.** Remove tracked `.DS_Store` files (root and `tests/`) and add them to `.gitignore`.
-- [ ] **L5.** Label `sample_snapshots/` as synthetic, or generate it from the tool.
-- [ ] **L6.** Remove unused imports and placeholder-less f-strings flagged by pyflakes (`config.py`, `core/RuleRepository.py`, `core/temporal_analysis.py`, `main.py`, `parsers/elastic_parser.py`).
-- [ ] **L7.** Remove or wire in unused methods: `get_coverage_score`, `has_sub_techniques`, `get_rule_complexity_score`, `validate_technique_list`, `is_valid_tactic`, `get_techniques_by_tactic`, `is_safe_for_logging`, `validate_input_string`. Move the bottom-of-file `Path` import in `base_parser.py` to the top.
-- [ ] **L8.** Split dev tools out of `requirements.txt`; drop the redundant `urllib3[secure]` line (could not reproduce a pip warning here, so cosmetic).
-- [ ] **L9.** Tone down marketing language ("Enterprise", "CISO") in output text; tie the version string to packaging.
+- [x] **L1.** README documents `MITRE_ANALYZER_*` environment variables that no code reads [V]. Implement or remove.
+- [x] **L2.** Placeholder repo URLs in README and `main.py:668`; README claims streaming/memory behavior that does not exist [V].
+- [x] **L3.** Delete `package_inits.py` (stale, wrong module names). Add real exports to `parsers/__init__.py`.
+- [x] **L4.** Remove tracked `.DS_Store` files (root and `tests/`) and add them to `.gitignore`.
+- [x] **L5.** Label `sample_snapshots/` as synthetic, or generate it from the tool.
+- [x] **L6.** Remove unused imports and placeholder-less f-strings flagged by pyflakes (`config.py`, `core/RuleRepository.py`, `core/temporal_analysis.py`, `main.py`, `parsers/elastic_parser.py`).
+- [x] **L7.** Remove or wire in unused methods: `get_coverage_score`, `has_sub_techniques`, `get_rule_complexity_score`, `validate_technique_list`, `is_valid_tactic`, `get_techniques_by_tactic`, `is_safe_for_logging`, `validate_input_string`. Move the bottom-of-file `Path` import in `base_parser.py` to the top.
+- [x] **L8.** Split dev tools out of `requirements.txt`; drop the redundant `urllib3[secure]` line (could not reproduce a pip warning here, so cosmetic).
+- [x] **L9.** Tone down marketing language ("Enterprise", "CISO") in output text; tie the version string to packaging.
 
 ---
 
@@ -137,75 +136,108 @@ Tasks
 
 ### Track B. Per-rule detection record and schema (owner requests 2 and 3)
 
-Goal (per owner): the tool derives what it can and emits a stable JSON Schema plus per-rule JSON files that other tools populate for the rest. The tool does not attempt to produce operational results.
+Goal (per owner): the tool derives what it can and emits a stable JSON Schema plus per-rule JSON files that other tools populate for the rest. The tool does not attempt to produce operational results, and does not call an LLM (D4).
+
+Status: design only. The owner will supply an example Sentinel schema; reconcile the field names below against it before writing the JSON Schema.
+
+#### Naming standard (D3 proposal)
+
+Conventions
+- JSON keys: `snake_case`, English, no abbreviations except well-known ones (`id`, `url`).
+- Identifiers end in `_id`. Lists are plural (`tables`), single values singular.
+- Durations: ISO 8601 (`PT1H`, `P7D`). Timestamps: RFC 3339 in UTC (`2026-11-09T16:24:31Z`). Enums: lowercase with hyphens or underscores as shown, always listed in the schema.
+- `null` means "unknown / not provided"; an empty list means "known to be none". Consumers must be able to tell them apart.
+- Every derived value that is a guess (query parsing, LLM) lives next to a `provenance` object; facts copied from the source rule do not need one.
+- Avoid overloaded words. Use `source_platform`, `target_platforms`, `cloud_providers`, `source_version`, `revision_count`, `lookback`, `environment_id`; never a bare `platform`, `version` or `revision`.
+
+File 1: `<detection_id>.detection.json` (tool-owned, regenerated every run)
+- `schema_version`, `generated_by {tool, tool_version, generated_at}`
+- `handling {sensitivity, notes}` where `sensitivity` is one of `public | internal | confidential | restricted`
+- `identity {detection_id, id_origin (source|generated), source_rule_id, name, description}`
+- `source {source_platform (elastic|sentinel|...), rule_kind (scheduled|nrt|eql|query|...), format (yaml|json|ndjson|toml), file_path (relative to the scanned root; never absolute), repository, source_version (string, as written), source_version_scheme (semver|integer|none), content_hash (sha256 of the normalized rule), revision_count (from VCS history, null if unavailable), created_at, modified_at}`
+- `status {enabled, severity (informational|low|medium|high|critical), risk_score}`
+- `schedule {frequency, lookback, lookback_source (rule|query), query_windows[]}` (durations ISO 8601; `query_windows` for `ago()`/`bin()`-style windows found inside the query, filled in B3)
+- `data {tables[], fields {entity_mappings[], custom_details[], referenced[]}, target_platforms[], cloud_providers[]}`
+  - `tables[]` items: `{name, origin (declared|query_parse), connector_or_integration}`
+  - `entity_mappings[]` items: `{entity_type, identifier, column}`; `custom_details[]` items: `{key, column}`
+  - `target_platforms` values come from the ATT&CK platform list in the loaded data (Windows, Linux, macOS, IaaS, SaaS, Containers, Identity Provider, Office Suite, Network Devices, ESXi, ...); `cloud_providers` values: `azure | aws | gcp | m365 | other`. Two fields because ATT&CK's `IaaS` does not say which cloud.
+- `attack {attack_version, techniques[] {technique_id, tactic (null if unpaired), remapped_from}, tactics[], notes[]}`
+
+File 2: `<detection_id>.enrichment.json` (owned by other tools; never overwritten by this tool)
+- `schema_version`, `detection_id`, `handling`
+- `analysis` (LLM or human authored): `intention {intent, logic, provenance}`, `method {categories[], parameters[], summary, provenance}`, each with `detection_content_hash` = the `source.content_hash` it was written against, so a changed rule makes the analysis detectably stale.
+  - `provenance {producer (llm|human|tool), model, model_version, prompt_id, produced_at, reviewed (bool), reviewed_by, confidence}`
+  - `method.categories` controlled vocabulary (extend in schema): `threshold | percentile | standard_deviation | series_anomaly | baseline_comparison | new_terms | sequence | correlation | indicator_match | machine_learning | signature`
+- `environments[]`: `{environment_id, name, kind (production|staging|development|lab), notes}` (no tenant or workspace secrets in this file)
+- `outcomes[]`: `{environment_id, rule_revision {source_version, content_hash}, window_start, window_end, counts {true_positive, benign_positive, false_positive, undetermined, false_negative}, source_system, notes}`
+- `validation.bas_results[]`: `{environment_id, tool, test_id, technique_id, outcome (detected|partially_detected|not_detected|not_tested), executed_at, rule_revision {source_version, content_hash}}`
+
+Why these choices
+- A single `rule_revision` pair ties every outcome and BAS result to the exact rule it was measured against, so numbers cannot silently carry over to a rewritten rule.
+- `false_negative` is only meaningful with a source that can know it (BAS, purple team, incident response); the schema permits `null` rather than 0.
+- `source_version` is stored verbatim because Sentinel uses semver strings and Elastic uses integers [U]; the count of revisions is a separate VCS-derived field.
 
 #### B0. Schema design
-- [ ] Publish `schemas/detection-record.schema.json` (JSON Schema 2020-12, `$id`, `schema_version`). Version independently from the tool.
-- [ ] Top-level blocks, each with a declared `owner` (see D1): `identity`, `source`, `schedule`, `data`, `attack`, `analysis`, `outcomes`, `validation`, `extensions`.
-- [ ] Provenance on every non-trivial value: `{source: parser|llm|external, tool, tool_version, timestamp, confidence?, reviewed_by?}`. Allows consumers to trust or discard derived data.
-- [ ] `additionalProperties: false` for tool-owned blocks; a namespaced `extensions` object (keys must start with `x_`) for other tools.
-- [ ] Output layout: one JSON file per rule named by `detection_id`, plus a JSONL index. Document file naming for synthesized IDs.
-- [ ] A `validate` subcommand that checks generated or merged files against the schema; ship example files.
+- [ ] Publish `schemas/detection.schema.json` and `schemas/enrichment.schema.json` (JSON Schema 2020-12, `$id`, `schema_version` semver, versioned independently of the tool).
+- [ ] `additionalProperties: false` for the detection file; the enrichment file allows a namespaced `extensions` object (keys must start with `x_`) so other tools can add fields without a schema change.
+- [ ] Output layout: one file of each kind per rule, named by `detection_id`, plus a JSONL index of detection files. Document naming for generated IDs.
+- [ ] A `validate` subcommand that checks files against the schemas; ship example files for Elastic and Sentinel.
+- [ ] Reconcile with the owner's example Sentinel schema before freezing names.
 
-#### B1. Field catalog and derivability
+#### B1. Field derivability (what the tool can fill)
 
-Legend for "Source": P = parsed from structured fields (deterministic), Q = needs query parsing, L = LLM-assisted, X = external tools populate.
+Source legend: P = parsed from structured fields, Q = needs query parsing, X = other tools populate, V = VCS history.
 
-| Requested field | Proposed schema field | Source | Notes |
+| Field | Where | Source | Notes |
 |---|---|---|---|
-| Detection GUID | `identity.detection_id`, `identity.source_rule_id`, `identity.id_synthesized` | P | See D2. Sentinel `id`; Elastic `rule_id`. |
-| Detection name | `identity.name` | P | |
-| Detection description | `identity.description` | P | Keep raw text; stop appending bracketed metadata into the description (today the parsers mutate it, e.g. `[Sentinel Config: ...]`). |
-| Tables used | `data.tables[]` | P, Q | Sentinel: `requiredDataConnectors[].dataTypes` is structured. Elastic: `index` patterns / `data_view_id`. KQL query parsing needed for completeness (let-bound functions, ASIM parsers such as `imAuthentication` expand to many tables, `union`, `join`). |
-| Fields used (entity / custom detail extraction) | `data.fields.entity_mapped[]`, `data.fields.custom_details[]`, `data.fields.query_referenced[]` | P (first two), Q (third) | Sentinel `entityMappings[].fieldMappings[].columnName` and `customDetails` are structured [U: Microsoft ARM reference]. Elastic `required_fields` (name, type) is informational only [U]. Phase 1 = structured sources only; query-referenced fields come later with a real parser. |
-| True positive / benign positive / false positive / undetermined / false negative | `outcomes.by_environment[].by_revision[]` with counts, window, source system | X | These are Sentinel incident classification terms. False negatives are not observable from alert data and come from BAS, purple team or IR. Counts must carry a time window and the rule revision they apply to. |
-| Environment | `outcomes.environments[]` (id, name, kind prod/dev/test, tenant/workspace ref) | X | Array, not a string. Sensitive (D6). |
-| Breach and attack simulation results | `validation.bas_results[]` | X | Per result: tool, test id, technique, outcome (detected / not detected / partial), date, rule revision tested, environment. |
-| Platform (Windows/Linux/Azure/GCP/...) | `data.target_platforms[]` and `source.siem_platform` | P, Q | Derive from tables via a maintained table-to-platform lookup (shares data with F3); mark as inferred. |
-| Number of revisions (based on version) | `source.source_version`, `source.source_version_scheme` (`semver`/`integer`/`none`), `source.revision_count` | P, VCS | Parse version as written; derive `revision_count` from git history when the source is a git checkout; never infer a count from a semver string. |
-| Lookback time | `schedule.query_period`, `schedule.query_frequency`, `schedule.lookback_internal[]` (ISO 8601 durations) | P, Q | Sentinel `queryPeriod`/`queryFrequency`; Elastic `from` and `interval` (date math, e.g. `now-6m`, `5m`) [U]. Internal windows (`ago()`, `bin()`) need query parsing. |
-| Detection intention (LLM: intent and logic text) | `analysis.intention.{intent, logic, provenance}` | L | See B5. |
-| Detection method (LLM: thresholds, percentile, stdev, series functions) | `analysis.method.{techniques[], thresholds[], windows[], provenance}` | Q first, L fallback | See B4. |
-| (added) Severity, enabled, schedule type, kind | `identity`/`schedule` | P | Already parsed today. |
-| (added) ATT&CK mapping | `attack.techniques[]`, `attack.tactics[]`, `attack.validated`, `attack.revoked_remaps[]`, `attack.version` | P | Depends on C1-C4. Keep tactic-technique pairs (H7). |
+| Detection GUID | `identity.detection_id`, `identity.id_origin`, `identity.source_rule_id` | P | D2. Sentinel `id`; Elastic `rule_id`. |
+| Name, description | `identity.name`, `identity.description` | P | Keep the raw text. Parsers no longer append bracketed metadata to descriptions. |
+| Tables used | `data.tables[]` | P, Q | Sentinel `requiredDataConnectors[].dataTypes` is structured. Elastic `index` patterns / `data_view_id`. Full KQL parsing (let-bound functions, ASIM parsers such as `imAuthentication` that expand to many tables, `union`, `join`) is B3. |
+| Fields used (entity / custom detail) | `data.fields.entity_mappings[]`, `custom_details[]`, `referenced[]` | P (first two), Q (third) | Sentinel `entityMappings` and `customDetails` are structured [U: Microsoft ARM reference]. Elastic `required_fields` is informational only [U]. |
+| Platform (Windows/Linux/Azure/GCP/...) | `data.target_platforms[]`, `data.cloud_providers[]` | P, Q | Derive from tables through a maintained table-to-platform lookup shared with F3; mark as inferred. |
+| Number of revisions | `source.source_version`, `source.revision_count` | P, V | Do not infer a count from a semver string. |
+| Lookback | `schedule.lookback`, `schedule.frequency`, `schedule.query_windows[]` | P, Q | Sentinel `queryPeriod`/`queryFrequency`; Elastic `from` and `interval` (date math such as `now-6m`) [U]. |
+| True/benign/false positive, undetermined, false negative | `enrichment.outcomes[]` | X | |
+| Environment | `enrichment.environments[]` | X | Sensitive (D6). |
+| BAS results | `enrichment.validation.bas_results[]` | X | |
+| Detection intention, detection method | `enrichment.analysis` | X (LLM or human) | Schema only (D4). |
+| Severity, enabled, rule kind | `status`, `source` | P | Already parsed today. |
+| ATT&CK mapping | `attack` | P | Done in the bug-fix pass: validated, revoked IDs remapped, tactic pairs kept. |
 
 #### B2. Structured extraction (no query parsing required)
-- [ ] Extend `DetectionRule` (or add a sibling `DetectionRecord` model) with the new fields; keep the existing model working for layer generation.
-- [ ] Sentinel: `requiredDataConnectors`, `entityMappings`, `customDetails`, `alertDetailsOverride`, `eventGroupingSettings`, `queryPeriod`, `queryFrequency`, `version`, `status`. Note: the public docs I found confirm `entityMappings`, `customDetails`, `alertDetailsOverride` and `queryPeriod`/`queryFrequency`; they did not confirm the YAML `version` field or the `eventGroupingSettings` sub-fields, so base those on the fixtures and the Azure-Sentinel repo, not on docs [U].
+- [ ] Add a `DetectionRecord` model (sibling of `DetectionRule`) and a serializer producing the detection file; keep the existing model for layer generation.
+- [ ] Sentinel: `requiredDataConnectors`, `entityMappings`, `customDetails`, `alertDetailsOverride`, `eventGroupingSettings`, `queryPeriod`, `queryFrequency`, `version`, `status`. The public docs I found confirm `entityMappings`, `customDetails`, `alertDetailsOverride` and `queryPeriod`/`queryFrequency`; they did not confirm the YAML `version` field or the `eventGroupingSettings` sub-fields, so base those on the fixtures and the owner's example schema [U].
 - [ ] Elastic: `rule_id`, `index`, `data_view_id`, `required_fields`, `related_integrations`, `from`, `interval`, `version`, `risk_score`, `severity`, `type`, `language`.
-- [ ] Duration normalization helper (`5m`, `1h`, `P1D`, `now-6m`, `7d`) with tests.
-- [ ] Preserve the raw query text and language (`kql`, `eql`, `esql`, `lucene`) in the record so later analysis stages can use it.
+- [ ] Duration normalization helper (`5m`, `1h`, `P1D`, `now-6m`, `7d`) to ISO 8601, with tests.
+- [ ] Preserve the raw query text and language (`kql`, `eql`, `esql`, `lucene`) so later stages can use it.
+- [ ] `source.content_hash`: sha256 over a normalized form of the rule (key order and comments removed) so cosmetic edits do not invalidate enrichment.
 
 #### B3. Table and field extraction from queries (second phase)
-- [ ] Evaluate parser options for KQL in Python (there is no first-party Python KQL parser that I verified; evaluate options and record the decision). Regex is acceptable only for a clearly labeled "best effort" mode.
-- [ ] Handle `let` bindings, user functions, ASIM/normalization parsers (map known parser names to the set of underlying tables, data file shared with F3), `union`, `join`, `externaldata`, and watchlists.
-- [ ] Mark each extracted table/field with its source (`structured` vs `query_parse`) and confidence.
+- [ ] Evaluate KQL parser options in Python (none first-party that I verified) and record the decision. Regex is acceptable only as a labeled best-effort mode.
+- [ ] Handle `let` bindings, user functions, ASIM/normalization parsers (map known parser names to underlying tables; data file shared with F3), `union`, `join`, `externaldata`, watchlists.
+- [ ] Mark each extracted table and field with `origin` (`declared` vs `query_parse`) and confidence.
 
-#### B4. Detection method extraction
-- [ ] Deterministic detector first: KQL `summarize`, `count()`/`dcount()` thresholds in `where`, `percentile()`/`percentiles()`, `stdev()`, `avg`, `make-series`, `series_decompose_anomalies`, `series_fit_*`, `bin()`; Elastic `threshold` rules, `new_terms`, ML job references, EQL `sequence ... maxspan`. Output a normalized list of method tags with extracted numeric parameters where present.
-- [ ] LLM only for what the deterministic pass cannot classify; never let the LLM overwrite deterministic results (store both, with provenance).
-- [ ] Controlled vocabulary for method tags (documented in the schema), so downstream tools can filter on them.
+#### B4. Detection method extraction (deterministic, no LLM)
+- [ ] KQL `summarize`, `count()`/`dcount()` thresholds in `where`, `percentile()`/`percentiles()`, `stdev()`, `avg`, `make-series`, `series_decompose_anomalies`, `series_fit_*`, `bin()`; Elastic `threshold`, `new_terms`, ML job references, EQL `sequence ... maxspan`.
+- [ ] Output method category tags (controlled vocabulary above) with extracted numeric parameters. Written to `data`/`schedule` in the detection file when deterministic; the enrichment `analysis.method` stays reserved for external (LLM/human) analysis.
 
-#### B5. LLM analysis: detection intention and method summaries
-- [ ] Provider interface (`LLMProvider.analyze(structured_rule) -> text`) with implementations behind optional extras; off by default; a local-model option; a `--llm-dry-run` that prints what would be sent.
-- [ ] Input is the parsed structure (identity, tables, entities, query, schedule), not the whole file; apply a redaction step for tenant/workspace identifiers and watchlist contents.
-- [ ] Cache by content hash plus prompt version; record model, prompt hash, timestamp, and `reviewed: false` in provenance.
-- [ ] Output constraints: schema-validated JSON, bounded length, no free-form fields that other tools will treat as authoritative.
-- [ ] Evaluation set: a small hand-labeled set of rules with expected intent/method tags to catch regressions when prompts or models change.
+#### B5. LLM output schema only (per D4)
+- [ ] Define `analysis.intention`, `analysis.method` and `provenance` in `enrichment.schema.json` (see naming standard). No LLM client, prompts, redaction, caching or evaluation code in this tool.
+- [ ] Document the contract for producers: required provenance fields, the `detection_content_hash` rule, and that consumers must treat `reviewed: false` content as unverified.
 
-#### B6. Merge and lifecycle
-- [ ] `merge` command implementing D1: update tool-owned blocks, preserve foreign-owned blocks, flag conflicts (for example the rule's `source_version` changed since outcomes were recorded, making old outcomes stale).
-- [ ] Mark `outcomes` and `validation` entries as stale when their recorded revision differs from the current one; never silently carry them forward as current.
-- [ ] Deleted/renamed rules: keep tombstones or archive, per D2.
-- [ ] Document the contract for external tools: how to find the schema, which blocks they may write, how to supply provenance.
+#### B6. Skeleton, staleness and lifecycle (per D1)
+- [ ] When generating a detection file, create an empty `enrichment.json` skeleton only if none exists; never modify an existing one.
+- [ ] `check-enrichment` command: report enrichment files whose recorded `detection_content_hash` or `rule_revision` no longer matches the current rule (stale), whose detection no longer exists (orphaned), and detections without enrichment.
+- [ ] Deleted or renamed rules: keep enrichment files, report them as orphaned; with generated IDs (D2) a rename creates a new ID, so document how to move an enrichment file.
+- [ ] Document the contract for external tools: where the schemas live, which file they may write, how to supply provenance.
 
 #### B7. Concerns tracked from the design review
-- [ ] Regeneration clobbering externally supplied data -> D1, B6.
-- [ ] Sending rule content to an external LLM -> D4, B5.
-- [ ] Overloaded terms (platform, revision, environment, lookback) -> D3.
-- [ ] Heuristic outputs (tables/fields/platform from query parsing, LLM text) presented as facts -> provenance and confidence on every derived value (B0).
-- [ ] Outcome metrics without time window or revision are misleading -> required fields in the schema (B1).
-- [ ] Scope creep pulling the coverage tool away from correctness -> D7 sequencing.
+- [x] Regeneration clobbering externally supplied data -> resolved by the two-file model (D1) and B6.
+- [x] Sending rule content to an external LLM -> out of scope for the tool (D4).
+- [ ] Overloaded terms -> naming standard above; confirm against the owner's example schema.
+- [ ] Heuristic outputs presented as facts -> `origin`/`provenance` on every derived value (B0, B3).
+- [ ] Outcome metrics without window or revision -> `rule_revision`, `window_start`, `window_end` required in `outcomes[]`.
+- [ ] Generated-ID stability on rename (D2) -> documented limitation; revisit if it hurts.
 
 ### Track C. Other feature gaps from the review
 - [ ] **F8. More rule sources**: Sigma (`attack.tXXXX` tags, stable `id` UUIDs) as the first addition, then Splunk ESCU, Chronicle YARA-L, Defender custom detections. Parsers must follow the content-routing design from C5.
@@ -228,10 +260,10 @@ Legend for "Source": P = parsed from structured fields (deterministic), Q = need
 
 ## 7. Suggested order
 
-1. C1, C2, C4, H5, H6, M12 (validator and data model rewrite, version handling, caching).
-2. C3, C5, H2, H3, H4 (parsing and layer output).
-3. C6, C7, M1-M4 (file and path handling, temporal analysis).
-4. H8 in parallel from step 1 (tests and CI), then M5-M11.
-5. D1-D6 decisions, then Track B (B0, B1, B2, B6), then F1-F3.
-6. B3-B5 (query parsing, method extraction, LLM), F4-F7, then Track C.
-7. L-items as opportunistic cleanup.
+1. (done) Sections 1-4: bug fixes, tests, CI, documentation.
+2. Receive the owner's example Sentinel schema; reconcile the naming standard (B0).
+3. B0, B2, B6: schemas, detection-file serializer, enrichment skeleton and staleness check.
+4. F1-F3: ATT&CK detection strategies, analytics, data components, and the table-to-data-component mapping file (it also feeds `data.target_platforms`).
+5. B3-B4: query parsing and deterministic method extraction.
+6. F4-F7, then Track C.
+7. Optional engineering follow-ups: mypy pass, process-based parsing if profiling on a large rule set shows a need (M7), Navigator UI check of H2/H7 behavior.
